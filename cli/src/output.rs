@@ -2987,6 +2987,10 @@ Options:
                        origins are allowed by default. Can also be set with
                        AGENT_BROWSER_DASHBOARD_ALLOWED_ORIGINS.
 
+Ports must be integers from 1 to 65535. Every allowed origin must be valid.
+Unknown options, missing values, and malformed origins fail without starting
+the dashboard server.
+
 Global Options:
   --json               Output as JSON
 

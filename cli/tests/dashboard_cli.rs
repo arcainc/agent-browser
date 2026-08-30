@@ -1,7 +1,11 @@
 //! Integration tests for the standalone dashboard lifecycle.
 
 use serde_json::Value;
+use std::io::{Read, Write};
+use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr, TcpListener, TcpStream};
 use std::process::{Child, Command, Output, Stdio};
+use std::thread;
+use std::time::{Duration, Instant};
 use tempfile::TempDir;
 
 #[cfg(unix)]
@@ -28,6 +32,40 @@ impl Drop for RunningDashboard {
 
 fn socket_dir(tmp: &TempDir) -> std::path::PathBuf {
     tmp.path().join("sockets")
+}
+
+fn unused_loopback_port() -> u16 {
+    TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+        .unwrap()
+        .local_addr()
+        .unwrap()
+        .port()
+}
+
+fn wait_for_dashboard(address: SocketAddr, host: &str, origin: &str) -> String {
+    let deadline = Instant::now() + Duration::from_secs(3);
+    loop {
+        match TcpStream::connect_timeout(&address, Duration::from_millis(100)) {
+            Ok(mut stream) => {
+                stream
+                    .write_all(
+                        format!(
+                            "GET /api/sessions HTTP/1.1\r\nHost: {host}\r\nOrigin: {origin}\r\nConnection: close\r\n\r\n"
+                        )
+                        .as_bytes(),
+                    )
+                    .unwrap();
+                let mut response = String::new();
+                stream.read_to_string(&mut response).unwrap();
+                return response;
+            }
+            Err(error) if Instant::now() < deadline => {
+                let _ = error;
+                thread::sleep(Duration::from_millis(25));
+            }
+            Err(error) => panic!("dashboard did not accept {address}: {error}"),
+        }
+    }
 }
 
 fn seed_running_dashboard(tmp: &TempDir, port: u16, allowed_origins: &[&str]) -> RunningDashboard {
@@ -83,7 +121,7 @@ fn json_output(output: &Output) -> Value {
 fn explicit_dashboard_start_accepts_mcp_style_arguments() {
     let tmp = TempDir::new().unwrap();
     let _cleanup = DashboardCleanup(&tmp);
-    let port = 0;
+    let port = unused_loopback_port();
     let port_arg = port.to_string();
 
     let started = run_dashboard(
@@ -121,9 +159,72 @@ fn explicit_dashboard_start_accepts_mcp_style_arguments() {
 }
 
 #[test]
+fn dashboard_listens_on_and_authorizes_ipv6_loopback() {
+    // Some minimal CI/container kernels disable IPv6 entirely. In that case
+    // the production server deliberately remains available on IPv4 only.
+    if TcpListener::bind((Ipv6Addr::LOCALHOST, 0)).is_err() {
+        return;
+    }
+
+    let tmp = TempDir::new().unwrap();
+    let _cleanup = DashboardCleanup(&tmp);
+    let port = unused_loopback_port();
+    let port_arg = port.to_string();
+
+    let started = run_dashboard(&tmp, &["dashboard", "start", "--port", &port_arg, "--json"]);
+    assert!(started.status.success());
+
+    let response = wait_for_dashboard(
+        SocketAddr::from((Ipv6Addr::LOCALHOST, port)),
+        &format!("[::1]:{port}"),
+        &format!("http://[::1]:{port}"),
+    );
+    assert!(
+        response.starts_with("HTTP/1.1 200 OK"),
+        "unexpected IPv6 dashboard response: {response}"
+    );
+}
+
+#[test]
+fn invalid_dashboard_options_fail_without_starting_a_server() {
+    let cases: &[&[&str]] = &[
+        &["dashboard", "--bogus", "--json"],
+        &[
+            "dashboard",
+            "start",
+            "--allowed-origin",
+            "https://dashboard.example.com",
+            "--json",
+        ],
+        &["dashboard", "start", "--port", "nope", "--json"],
+        &["dashboard", "start", "--port", "0", "--json"],
+        &["dashboard", "start", "--port", "--json"],
+        &[
+            "dashboard",
+            "start",
+            "--allowed-origins",
+            "https://dashboard.example.com,invalid",
+            "--json",
+        ],
+    ];
+
+    for args in cases {
+        let tmp = TempDir::new().unwrap();
+        let output = run_dashboard(&tmp, args);
+        assert!(
+            !output.status.success(),
+            "invalid arguments unexpectedly succeeded: {args:?}"
+        );
+        assert_eq!(json_output(&output)["success"], false);
+        assert!(!socket_dir(&tmp).join("dashboard.pid").exists());
+        assert!(!socket_dir(&tmp).join("dashboard.config").exists());
+    }
+}
+
+#[test]
 fn running_dashboard_rejects_configuration_changes() {
     let tmp = TempDir::new().unwrap();
-    let port = 0;
+    let port = unused_loopback_port();
     let _dashboard = seed_running_dashboard(
         &tmp,
         port,

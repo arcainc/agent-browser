@@ -445,7 +445,7 @@ agent-browser dashboard start --allowed-origins <origins> # Allow exact HTTPS re
 agent-browser dashboard stop          # Stop the dashboard server
 ```
 
-Loopback dashboard origins are accepted by default. For a reverse-proxied or forwarded URL, pass its exact browser origin with `--allowed-origins` or set `AGENT_BROWSER_DASHBOARD_ALLOWED_ORIGINS`. The command prints private access URLs for external origins and the local dashboard; open one once to establish the browser session and do not share it. The browser stays on the dashboard origin; per-session tabs, status, and stream traffic are proxied internally, so session ports do not need to be exposed. Stop the running dashboard before changing the port or allowed origins.
+Loopback dashboard origins are accepted by default. For a reverse-proxied or forwarded URL, pass its exact browser origin with `--allowed-origins` or set `AGENT_BROWSER_DASHBOARD_ALLOWED_ORIGINS`. Every configured origin must be a valid exact HTTPS origin. Ports must be integers from 1 to 65535. Unknown options, missing values, invalid ports, and malformed origins fail without starting the server. The command prints private access URLs for external origins and the local dashboard; open one once to establish the browser session and do not share it. The browser stays on the dashboard origin; per-session tabs, status, and stream traffic are proxied internally, so session ports do not need to be exposed. Stop the running dashboard before changing the port or allowed origins.
 
 ## Doctor
 

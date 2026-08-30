@@ -505,7 +505,7 @@ agent-browser dashboard start --allowed-origins https://dashboard.example.com
 # Or: AGENT_BROWSER_DASHBOARD_ALLOWED_ORIGINS=https://dashboard.example.com agent-browser dashboard start
 ```
 
-Use comma-separated origins only when each is a trusted dashboard URL. When external origins are configured, the command prints private access URLs for them and the local dashboard. Open one URL once to establish the browser session and do not share it; its unguessable token is carried in the initial fragment, then stored in a same-site cookie for dashboard API and stream requests. Configure the reverse proxy to redact cookies from logs. The dashboard rejects requests with missing or cross-origin browser provenance. Repeated starts reuse a running dashboard only when the port and allowed origins match; run `agent-browser dashboard stop` before changing either setting.
+Use comma-separated origins only when each is a trusted dashboard URL. Every origin must be a valid exact HTTPS origin, and custom ports must be integers from 1 to 65535. Invalid dashboard options fail without starting the server. When external origins are configured, the command prints private access URLs for them and the local dashboard. Open one URL once to establish the browser session and do not share it; its unguessable token is carried in the initial fragment, then stored in a same-site cookie for dashboard API and stream requests. Configure the reverse proxy to redact cookies from logs. The dashboard rejects requests with missing or cross-origin browser provenance. Repeated starts reuse a running dashboard only when the port and allowed origins match; run `agent-browser dashboard stop` before changing either setting.
 
 ## Full reference
 

@@ -1747,10 +1747,11 @@ fn parity_tools() -> Vec<Value> {
             "Dashboard start",
             "Start dashboard server. When the dashboard is exposed through a reverse proxy, configure its exact browser origin with allowedOrigins. Stop a running dashboard before changing its port or allowed origins.",
             json!({
-                "port": { "type": "integer" },
+                "port": { "type": "integer", "minimum": 1, "maximum": 65535 },
                 "allowedOrigins": {
                     "type": "string",
-                    "description": "Comma-separated exact HTTPS origins allowed to use a reverse-proxied dashboard. Local loopback origins are allowed by default."
+                    "minLength": 1,
+                    "description": "Comma-separated exact HTTPS origins allowed to use a reverse-proxied dashboard. Every entry must be valid. Local loopback origins are allowed by default."
                 }
             }),
             &[],
@@ -4359,6 +4360,12 @@ mod tests {
             tool["inputSchema"]["properties"]["allowedOrigins"]["type"],
             "string"
         );
+        assert_eq!(
+            tool["inputSchema"]["properties"]["allowedOrigins"]["minLength"],
+            1
+        );
+        assert_eq!(tool["inputSchema"]["properties"]["port"]["minimum"], 1);
+        assert_eq!(tool["inputSchema"]["properties"]["port"]["maximum"], 65535);
 
         let args = dashboard_start_args(&json!({
             "port": 8080,

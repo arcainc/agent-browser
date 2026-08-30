@@ -1,5 +1,6 @@
 use futures_util::{SinkExt, StreamExt};
 use serde_json::{json, Value};
+use std::net::{Ipv4Addr, Ipv6Addr};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 use tokio_tungstenite::tungstenite::Message;
@@ -133,12 +134,10 @@ fn normalize_origin_authority(origin: &str) -> Option<String> {
     if !url.username().is_empty() || url.password().is_some() {
         return None;
     }
+    // `url::Url::host_str` already includes brackets around IPv6 literals.
+    // Adding another pair would turn `[::1]` into `[[::1]]` and prevent the
+    // documented IPv6 loopback origin from matching the Host header.
     let host = url.host_str()?.to_ascii_lowercase();
-    let host = if host.contains(':') {
-        format!("[{host}]")
-    } else {
-        host
-    };
     let default_port = (url.scheme() == "http" && url.port() == Some(80))
         || (url.scheme() == "https" && url.port() == Some(443));
     Some(match url.port() {
@@ -227,21 +226,36 @@ fn normalized_dashboard_allowed_origin(value: &str) -> Option<String> {
     Some(origin)
 }
 
-/// Normalize a comma-separated dashboard origin allowlist into the exact set
-/// enforced by the server. Sorting makes equivalent configurations stable for
-/// lifecycle comparisons in the parent CLI process.
-pub fn normalize_dashboard_allowed_origins(value: Option<&str>) -> Vec<String> {
-    let mut origins: Vec<String> = value
-        .into_iter()
-        .flat_map(|value| value.split(','))
-        .filter_map(|origin| normalized_dashboard_allowed_origin(origin.trim()))
-        .collect();
+/// Validate and normalize a comma-separated dashboard origin allowlist into
+/// the exact set enforced by the server. Invalid entries reject the entire
+/// configuration so a typo cannot silently weaken reverse-proxy protection.
+/// Sorting makes equivalent configurations stable for lifecycle comparisons
+/// in the parent CLI process.
+pub fn normalize_dashboard_allowed_origins(value: Option<&str>) -> Result<Vec<String>, String> {
+    let Some(value) = value else {
+        return Ok(Vec::new());
+    };
+
+    if value.trim().is_empty() {
+        return Err("Dashboard allowed origins cannot be empty.".to_string());
+    }
+
+    let mut origins = Vec::new();
+    for value in value.split(',') {
+        let value = value.trim();
+        let origin = normalized_dashboard_allowed_origin(value).ok_or_else(|| {
+            format!(
+                "Invalid dashboard allowed origin '{value}'. Expected an exact non-loopback HTTPS origin without a path, query, fragment, or credentials."
+            )
+        })?;
+        origins.push(origin);
+    }
     origins.sort();
     origins.dedup();
-    origins
+    Ok(origins)
 }
 
-fn allowed_dashboard_origins() -> Vec<String> {
+fn allowed_dashboard_origins() -> Result<Vec<String>, String> {
     let configured = std::env::var("AGENT_BROWSER_DASHBOARD_ALLOWED_ORIGINS").ok();
     normalize_dashboard_allowed_origins(configured.as_deref())
 }
@@ -257,7 +271,10 @@ fn dashboard_access_token() -> Option<String> {
 }
 
 fn access_token_matches(request: &str) -> bool {
-    if allowed_dashboard_origins().is_empty() {
+    let Ok(allowed_origins) = allowed_dashboard_origins() else {
+        return false;
+    };
+    if allowed_origins.is_empty() {
         return true;
     }
     dashboard_access_token().as_deref().is_some_and(|expected| {
@@ -301,8 +318,7 @@ fn header_is_trusted_dashboard_origin(request: &str, header_name: &str) -> bool 
 
     (is_loopback_authority(&host) && is_loopback_dashboard_origin(&origin))
         || allowed_dashboard_origins()
-            .iter()
-            .any(|allowed| allowed == &origin)
+            .is_ok_and(|allowed| allowed.iter().any(|allowed| allowed == &origin))
 }
 
 /// Validates that a proxied WebSocket request came from a trusted dashboard
@@ -575,15 +591,40 @@ async fn proxy_session_stream(mut stream: tokio::net::TcpStream, port: u16) {
 }
 
 pub async fn run_dashboard_server(port: u16) {
-    let addr = format!("127.0.0.1:{}", port);
-    let listener = match TcpListener::bind(&addr).await {
+    let ipv4_addr = (Ipv4Addr::LOCALHOST, port);
+    let ipv4_listener = match TcpListener::bind(ipv4_addr).await {
         Ok(l) => l,
         Err(e) => {
-            eprintln!("Failed to bind dashboard server on {}: {}", addr, e);
+            eprintln!("Failed to bind dashboard server on 127.0.0.1:{port}: {e}");
             return;
         }
     };
 
+    // Port zero is useful for internal tests. Bind IPv6 to the same selected
+    // port so both loopback families reach one dashboard instance.
+    let bound_port = ipv4_listener
+        .local_addr()
+        .map(|address| address.port())
+        .unwrap_or(port);
+    let ipv6_listener = match TcpListener::bind((Ipv6Addr::LOCALHOST, bound_port)).await {
+        Ok(listener) => Some(listener),
+        Err(error) => {
+            eprintln!("Failed to bind dashboard server on [::1]:{bound_port}: {error}");
+            None
+        }
+    };
+
+    if let Some(ipv6_listener) = ipv6_listener {
+        tokio::join!(
+            run_dashboard_listener(ipv4_listener),
+            run_dashboard_listener(ipv6_listener)
+        );
+    } else {
+        run_dashboard_listener(ipv4_listener).await;
+    }
+}
+
+async fn run_dashboard_listener(listener: TcpListener) {
     loop {
         let Ok((stream, _addr)) = listener.accept().await else {
             break;
@@ -1291,14 +1332,18 @@ mod tests {
             normalize_origin_authority("http://attacker@localhost:4848"),
             None
         );
+        assert_eq!(
+            normalize_origin_authority("http://[::1]:4848"),
+            Some("[::1]:4848".to_string())
+        );
     }
 
     #[test]
     fn test_normalize_dashboard_allowed_origins_canonicalizes_a_set() {
         assert_eq!(
             normalize_dashboard_allowed_origins(Some(
-                "https://second.example.com, https://dashboard.example.com:443,https://second.example.com,invalid"
-            )),
+                "https://second.example.com, https://dashboard.example.com:443,https://second.example.com"
+            )).unwrap(),
             vec![
                 "https://dashboard.example.com".to_string(),
                 "https://second.example.com".to_string()
@@ -1307,13 +1352,29 @@ mod tests {
     }
 
     #[test]
-    fn test_normalize_dashboard_allowed_origins_rejects_loopback_and_plain_http() {
-        assert_eq!(
-            normalize_dashboard_allowed_origins(Some(
-                "http://dashboard.example.com,https://dashboard.example.com,http://localhost:4848"
-            )),
-            vec!["https://dashboard.example.com".to_string()]
-        );
+    fn test_normalize_dashboard_allowed_origins_rejects_every_invalid_entry() {
+        for value in [
+            "",
+            "invalid",
+            "http://dashboard.example.com",
+            "https://dashboard.example.com/path",
+            "https://dashboard.example.com,invalid",
+            "http://localhost:4848",
+        ] {
+            assert!(
+                normalize_dashboard_allowed_origins(Some(value)).is_err(),
+                "unexpectedly accepted {value}"
+            );
+        }
+    }
+
+    #[test]
+    fn ipv6_loopback_dashboard_request_is_authorized() {
+        let _guard = EnvGuard::new(&[]);
+        let request =
+            "GET /api/sessions HTTP/1.1\r\nHost: [::1]:4848\r\nOrigin: http://[::1]:4848\r\n\r\n";
+
+        assert!(is_same_origin_dashboard_request(request));
     }
 
     #[test]

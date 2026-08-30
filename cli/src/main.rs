@@ -779,8 +779,7 @@ struct DashboardConfig {
 }
 
 impl DashboardConfig {
-    fn new(port: u16, allowed_origins: Option<&str>) -> Result<Self, String> {
-        let allowed_origins = native::stream::normalize_dashboard_allowed_origins(allowed_origins);
+    fn new(port: u16, allowed_origins: Vec<String>) -> Result<Self, String> {
         let access_token = if allowed_origins.is_empty() {
             None
         } else {
@@ -824,6 +823,90 @@ impl DashboardConfig {
             .map(|origin| format!("{origin}/#dashboard-access-token={token}"))
             .collect()
     }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum DashboardCommand {
+    Start {
+        port: u16,
+        allowed_origins: Option<String>,
+    },
+    Stop,
+}
+
+/// Parse dashboard-specific arguments independently of the general command
+/// parser. This keeps the standalone lifecycle strict: unknown flags, missing
+/// values, invalid ports, and options supplied to `stop` are all errors.
+fn parse_dashboard_command(args: &[String]) -> Result<DashboardCommand, String> {
+    let (subcommand, mut index) = match args.first().map(String::as_str) {
+        Some("start") => ("start", 1),
+        Some("stop") => ("stop", 1),
+        Some(value) if !value.starts_with('-') => {
+            return Err(format!("Unknown dashboard subcommand: {value}"));
+        }
+        _ => ("start", 0),
+    };
+
+    if subcommand == "stop" {
+        if let Some(argument) = args.get(index) {
+            return Err(format!(
+                "Dashboard stop does not accept argument '{argument}'."
+            ));
+        }
+        return Ok(DashboardCommand::Stop);
+    }
+
+    let mut port = 4848;
+    let mut saw_port = false;
+    let mut allowed_origins = None;
+
+    while let Some(argument) = args.get(index) {
+        match argument.as_str() {
+            "--port" => {
+                if saw_port {
+                    return Err(
+                        "Dashboard option '--port' was provided more than once.".to_string()
+                    );
+                }
+                let value = args
+                    .get(index + 1)
+                    .filter(|value| !value.starts_with('-'))
+                    .ok_or_else(|| "Dashboard option '--port' requires a value.".to_string())?;
+                port = value.parse::<u16>().ok().filter(|port| *port > 0).ok_or_else(|| {
+                    format!("Invalid dashboard port '{value}'. Expected an integer from 1 to 65535.")
+                })?;
+                saw_port = true;
+                index += 2;
+            }
+            "--allowed-origins" => {
+                if allowed_origins.is_some() {
+                    return Err(
+                        "Dashboard option '--allowed-origins' was provided more than once."
+                            .to_string(),
+                    );
+                }
+                let value = args
+                    .get(index + 1)
+                    .filter(|value| !value.starts_with('-'))
+                    .ok_or_else(|| {
+                        "Dashboard option '--allowed-origins' requires a value.".to_string()
+                    })?;
+                allowed_origins = Some(value.clone());
+                index += 2;
+            }
+            value if value.starts_with('-') => {
+                return Err(format!("Unknown dashboard option: {value}"));
+            }
+            value => {
+                return Err(format!("Unexpected dashboard argument: {value}"));
+            }
+        }
+    }
+
+    Ok(DashboardCommand::Start {
+        port,
+        allowed_origins,
+    })
 }
 
 fn generate_dashboard_access_token() -> Result<String, String> {
@@ -897,10 +980,8 @@ fn dashboard_config_issue(
 /// cannot grant access to an attacker-controlled origin. Persist the effective
 /// settings beside the PID so repeated starts cannot silently claim that a live
 /// process adopted different settings.
-fn run_dashboard_start(port: u16, allowed_origins: Option<&str>, json_mode: bool) {
+fn run_dashboard_start(port: u16, allowed_origins: Vec<String>, json_mode: bool) {
     let pid_path = get_dashboard_pid_path();
-    let requested_allowed_origins =
-        native::stream::normalize_dashboard_allowed_origins(allowed_origins);
 
     // Check if already running
     if let Ok(pid_str) = fs::read_to_string(&pid_path) {
@@ -909,7 +990,7 @@ fn run_dashboard_start(port: u16, allowed_origins: Option<&str>, json_mode: bool
                 let running_config = read_dashboard_config();
                 let requested_config = DashboardConfig {
                     port,
-                    allowed_origins: requested_allowed_origins,
+                    allowed_origins,
                     access_token: None,
                 };
                 if let Some(error) =
@@ -1343,33 +1424,43 @@ fn main() {
     // Handle dashboard subcommand
     if clean.first().map(|s| s.as_str()) == Some("dashboard") {
         let dashboard_args = &clean[1..];
-        match dashboard_args.first().map(|s| s.as_str()) {
-            Some("stop") => {
+        let command = match parse_dashboard_command(dashboard_args) {
+            Ok(command) => command,
+            Err(error) => {
+                if flags.json {
+                    print_json_error(error);
+                } else {
+                    eprintln!("{} {}", color::error_indicator(), error);
+                }
+                exit(1);
+            }
+        };
+
+        match command {
+            DashboardCommand::Stop => {
                 run_dashboard_stop(flags.json);
                 return;
             }
-            Some(unknown) if unknown != "start" && !unknown.starts_with('-') => {
-                eprintln!(
-                    "{} Unknown dashboard subcommand: {}",
-                    color::error_indicator(),
-                    unknown
-                );
-                exit(1);
-            }
-            _ => {
-                let port = clean
-                    .iter()
-                    .position(|a| a == "--port")
-                    .and_then(|i| clean.get(i + 1))
-                    .and_then(|s| s.parse::<u16>().ok())
-                    .unwrap_or(4848);
-                let cli_allowed_origins = args
-                    .iter()
-                    .position(|a| a == "--allowed-origins")
-                    .and_then(|i| args.get(i + 1))
-                    .map(String::as_str);
+            DashboardCommand::Start {
+                port,
+                allowed_origins,
+            } => {
                 let env_allowed_origins = env::var("AGENT_BROWSER_DASHBOARD_ALLOWED_ORIGINS").ok();
-                let allowed_origins = cli_allowed_origins.or(env_allowed_origins.as_deref());
+                let configured_origins = allowed_origins
+                    .as_deref()
+                    .or(env_allowed_origins.as_deref());
+                let allowed_origins =
+                    match native::stream::normalize_dashboard_allowed_origins(configured_origins) {
+                        Ok(origins) => origins,
+                        Err(error) => {
+                            if flags.json {
+                                print_json_error(error);
+                            } else {
+                                eprintln!("{} {}", color::error_indicator(), error);
+                            }
+                            exit(1);
+                        }
+                    };
                 run_dashboard_start(port, allowed_origins, flags.json);
                 return;
             }
@@ -2197,15 +2288,28 @@ mod tests {
     fn dashboard_config_comparison_rejects_unknown_or_changed_settings() {
         let requested = DashboardConfig::new(
             4848,
-            Some("https://second.example.com, https://dashboard.example.com"),
+            native::stream::normalize_dashboard_allowed_origins(Some(
+                "https://second.example.com, https://dashboard.example.com",
+            ))
+            .unwrap(),
         )
         .unwrap();
         let equivalent = DashboardConfig::new(
             4848,
-            Some("https://dashboard.example.com,https://second.example.com"),
+            native::stream::normalize_dashboard_allowed_origins(Some(
+                "https://dashboard.example.com,https://second.example.com",
+            ))
+            .unwrap(),
         )
         .unwrap();
-        let changed = DashboardConfig::new(4849, Some("https://dashboard.example.com")).unwrap();
+        let changed = DashboardConfig::new(
+            4849,
+            native::stream::normalize_dashboard_allowed_origins(Some(
+                "https://dashboard.example.com",
+            ))
+            .unwrap(),
+        )
+        .unwrap();
 
         assert_eq!(dashboard_config_issue(Some(&equivalent), &requested), None);
         assert!(dashboard_config_issue(Some(&changed), &requested).is_some());
@@ -2213,15 +2317,41 @@ mod tests {
     }
 
     #[test]
-    fn dashboard_allowed_origins_flag_is_removed_from_command_args() {
+    fn dashboard_parser_accepts_explicit_start_options() {
         let args = vec![
-            "dashboard".to_string(),
             "start".to_string(),
+            "--port".to_string(),
+            "8080".to_string(),
             "--allowed-origins".to_string(),
             "https://dashboard.example.com".to_string(),
         ];
 
-        assert_eq!(clean_args(&args), vec!["dashboard", "start"]);
+        assert_eq!(
+            parse_dashboard_command(&args),
+            Ok(DashboardCommand::Start {
+                port: 8080,
+                allowed_origins: Some("https://dashboard.example.com".to_string()),
+            })
+        );
+    }
+
+    #[test]
+    fn dashboard_parser_rejects_invalid_or_unknown_options() {
+        for args in [
+            vec!["--bogus"],
+            vec!["start", "--allowed-origin", "https://dashboard.example.com"],
+            vec!["start", "--port", "nope"],
+            vec!["start", "--port", "0"],
+            vec!["start", "--port"],
+            vec!["start", "--allowed-origins"],
+            vec!["stop", "--port", "4848"],
+        ] {
+            let args = args.into_iter().map(str::to_string).collect::<Vec<_>>();
+            assert!(
+                parse_dashboard_command(&args).is_err(),
+                "unexpectedly accepted {args:?}"
+            );
+        }
     }
 
     #[test]
