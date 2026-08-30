@@ -350,7 +350,7 @@ agent-browser dashboard start --allowed-origins https://dashboard.example.com
 agent-browser dashboard stop
 ```
 
-Loopback origins are allowed by default. Set `--allowed-origins` or `AGENT_BROWSER_DASHBOARD_ALLOWED_ORIGINS` to a comma-separated list of exact reverse-proxied origins. Repeated starts reuse the running dashboard only when the port and allowed origins match; stop it before changing either setting.
+Loopback origins are allowed by default. Set `--allowed-origins` or `AGENT_BROWSER_DASHBOARD_ALLOWED_ORIGINS` to a comma-separated list of exact HTTPS reverse-proxied origins. The command prints private access URLs for external origins and the local dashboard; open one once to establish the browser session and do not share it. Repeated starts reuse the running dashboard only when the port and allowed origins match; stop it before changing either setting.
 
 ## MCP Server
 
@@ -504,7 +504,7 @@ AGENT_BROWSER_WEBGPU="1"                     # Enable the WebGPU launch preset (
 AGENT_BROWSER_NO_XVFB="1"                    # Disable automatic Xvfb for headed mode on displayless Linux
 AGENT_BROWSER_PROVIDER="browserbase"         # Browser provider or configured provider plugin
 AGENT_BROWSER_STREAM_PORT="9223"             # Override WebSocket streaming port (default: OS-assigned)
-AGENT_BROWSER_DASHBOARD_ALLOWED_ORIGINS="https://dashboard.example.com" # Trusted reverse-proxied dashboard origins
+AGENT_BROWSER_DASHBOARD_ALLOWED_ORIGINS="https://dashboard.example.com" # Trusted HTTPS reverse-proxied dashboard origins
 AGENT_BROWSER_CONFIG="./agent-browser.json"  # Custom config file
 AGENT_BROWSER_CDP="9222"                     # Connect daemon to CDP port or WebSocket URL
 AGENT_BROWSER_ALLOWED_DOMAINS="example.com"  # Restrict network domains; requires a fresh controllable browser context without profile/session startup args, restore/state replay, or direct-page provider plugins

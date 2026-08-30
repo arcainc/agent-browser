@@ -21,6 +21,8 @@ use serde_json::json;
 use sha2::{Digest, Sha256};
 use std::env;
 use std::fs;
+#[cfg(unix)]
+use std::io::Write;
 use std::path::PathBuf;
 use std::process::{exit, Command};
 
@@ -772,14 +774,23 @@ fn get_dashboard_config_path() -> std::path::PathBuf {
 struct DashboardConfig {
     port: u16,
     allowed_origins: Vec<String>,
+    #[serde(default)]
+    access_token: Option<String>,
 }
 
 impl DashboardConfig {
-    fn new(port: u16, allowed_origins: Option<&str>) -> Self {
-        Self {
+    fn new(port: u16, allowed_origins: Option<&str>) -> Result<Self, String> {
+        let allowed_origins = native::stream::normalize_dashboard_allowed_origins(allowed_origins);
+        let access_token = if allowed_origins.is_empty() {
+            None
+        } else {
+            Some(generate_dashboard_access_token()?)
+        };
+        Ok(Self {
             port,
-            allowed_origins: native::stream::normalize_dashboard_allowed_origins(allowed_origins),
-        }
+            allowed_origins,
+            access_token,
+        })
     }
 
     fn allowed_origins_description(&self) -> String {
@@ -789,6 +800,37 @@ impl DashboardConfig {
             self.allowed_origins.join(",")
         }
     }
+
+    fn has_valid_access_token(&self) -> bool {
+        self.allowed_origins.is_empty()
+            || self
+                .access_token
+                .as_deref()
+                .is_some_and(native::stream::is_valid_dashboard_access_token)
+    }
+
+    fn has_same_settings_as(&self, requested: &Self) -> bool {
+        self.port == requested.port && self.allowed_origins == requested.allowed_origins
+    }
+
+    fn access_urls(&self) -> Vec<String> {
+        let Some(token) = self.access_token.as_deref() else {
+            return Vec::new();
+        };
+        self.allowed_origins
+            .iter()
+            .cloned()
+            .chain(std::iter::once(format!("http://localhost:{}", self.port)))
+            .map(|origin| format!("{origin}/#dashboard-access-token={token}"))
+            .collect()
+    }
+}
+
+fn generate_dashboard_access_token() -> Result<String, String> {
+    let mut bytes = [0u8; 32];
+    getrandom::getrandom(&mut bytes)
+        .map_err(|error| format!("Failed to generate dashboard access token: {error}"))?;
+    Ok(hex::encode(bytes))
 }
 
 fn read_dashboard_config() -> Option<DashboardConfig> {
@@ -801,7 +843,29 @@ fn remove_dashboard_sidecars() {
     let _ = fs::remove_file(get_dashboard_config_path());
 }
 
-fn dashboard_config_conflict(
+fn write_dashboard_config(config: &DashboardConfig) -> std::io::Result<()> {
+    let contents = serde_json::to_vec(config).map_err(std::io::Error::other)?;
+    let path = get_dashboard_config_path();
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+
+        let mut file = fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(path)?;
+        file.write_all(&contents)
+    }
+
+    #[cfg(windows)]
+    {
+        fs::write(path, contents)
+    }
+}
+
+fn dashboard_config_issue(
     running: Option<&DashboardConfig>,
     requested: &DashboardConfig,
 ) -> Option<String> {
@@ -811,7 +875,13 @@ fn dashboard_config_conflict(
                 .to_string(),
         );
     };
-    if running == requested {
+    if !running.has_valid_access_token() {
+        return Some(
+            "Dashboard is already running, but its access-token configuration could not be verified. Run 'agent-browser dashboard stop' before starting it again."
+                .to_string(),
+        );
+    }
+    if running.has_same_settings_as(requested) {
         return None;
     }
 
@@ -822,22 +892,28 @@ fn dashboard_config_conflict(
     ))
 }
 
-/// Start the dashboard and pass its explicit proxy-origin allowlist to the
-/// detached server process. This allowlist is deliberately separate from the
-/// request Host so DNS rebinding cannot grant an attacker-controlled origin.
-/// Persist the effective settings beside the PID so repeated starts cannot
-/// silently claim that a live process adopted different settings.
+/// Start the dashboard with an explicit proxy-origin allowlist and a unique
+/// access token. Both are kept separate from the request Host so DNS rebinding
+/// cannot grant access to an attacker-controlled origin. Persist the effective
+/// settings beside the PID so repeated starts cannot silently claim that a live
+/// process adopted different settings.
 fn run_dashboard_start(port: u16, allowed_origins: Option<&str>, json_mode: bool) {
     let pid_path = get_dashboard_pid_path();
-    let config_path = get_dashboard_config_path();
-    let requested_config = DashboardConfig::new(port, allowed_origins);
+    let requested_allowed_origins =
+        native::stream::normalize_dashboard_allowed_origins(allowed_origins);
 
     // Check if already running
     if let Ok(pid_str) = fs::read_to_string(&pid_path) {
         if let Ok(pid) = pid_str.trim().parse::<u32>() {
             if is_pid_alive(pid) {
+                let running_config = read_dashboard_config();
+                let requested_config = DashboardConfig {
+                    port,
+                    allowed_origins: requested_allowed_origins,
+                    access_token: None,
+                };
                 if let Some(error) =
-                    dashboard_config_conflict(read_dashboard_config().as_ref(), &requested_config)
+                    dashboard_config_issue(running_config.as_ref(), &requested_config)
                 {
                     if json_mode {
                         print_json_error(error);
@@ -847,21 +923,40 @@ fn run_dashboard_start(port: u16, allowed_origins: Option<&str>, json_mode: bool
                     exit(1);
                 }
                 if json_mode {
+                    let access_urls = running_config
+                        .as_ref()
+                        .map(DashboardConfig::access_urls)
+                        .unwrap_or_default();
                     print_json_value(json!({
                         "success": true,
-                        "data": { "port": requested_config.port, "pid": pid, "already_running": true },
+                        "data": { "port": requested_config.port, "pid": pid, "already_running": true, "access_urls": access_urls },
                     }));
                 } else {
                     println!(
                         "Dashboard already running at http://localhost:{}",
                         requested_config.port
                     );
+                    print_dashboard_access_urls(&running_config.expect("verified above"));
                 }
                 return;
             }
         }
         remove_dashboard_sidecars();
+    } else {
+        let _ = fs::remove_file(get_dashboard_config_path());
     }
+
+    let requested_config = match DashboardConfig::new(port, allowed_origins) {
+        Ok(config) => config,
+        Err(error) => {
+            if json_mode {
+                print_json_error(error);
+            } else {
+                eprintln!("{} {}", color::error_indicator(), error);
+            }
+            exit(1);
+        }
+    };
 
     let socket_dir = get_socket_dir();
     if !socket_dir.exists() {
@@ -891,10 +986,18 @@ fn run_dashboard_start(port: u16, allowed_origins: Option<&str>, json_mode: bool
     );
     if requested_config.allowed_origins.is_empty() {
         cmd.env_remove("AGENT_BROWSER_DASHBOARD_ALLOWED_ORIGINS");
+        cmd.env_remove("AGENT_BROWSER_DASHBOARD_ACCESS_TOKEN");
     } else {
         cmd.env(
             "AGENT_BROWSER_DASHBOARD_ALLOWED_ORIGINS",
             requested_config.allowed_origins.join(","),
+        )
+        .env(
+            "AGENT_BROWSER_DASHBOARD_ACCESS_TOKEN",
+            requested_config
+                .access_token
+                .as_deref()
+                .expect("generated above"),
         );
     }
 
@@ -925,9 +1028,7 @@ fn run_dashboard_start(port: u16, allowed_origins: Option<&str>, json_mode: bool
     {
         Ok(mut child) => {
             let pid = child.id();
-            let write_result = serde_json::to_vec(&requested_config)
-                .map_err(std::io::Error::other)
-                .and_then(|contents| fs::write(&config_path, contents))
+            let write_result = write_dashboard_config(&requested_config)
                 .and_then(|()| fs::write(&pid_path, pid.to_string()));
             if let Err(error) = write_result {
                 let _ = child.kill();
@@ -947,13 +1048,18 @@ fn run_dashboard_start(port: u16, allowed_origins: Option<&str>, json_mode: bool
             if json_mode {
                 print_json_value(json!({
                     "success": true,
-                    "data": { "port": requested_config.port, "pid": pid },
+                    "data": { "port": requested_config.port, "pid": pid, "access_urls": requested_config.access_urls() },
                 }));
             } else {
                 println!(
-                    "Dashboard started at http://localhost:{}",
-                    requested_config.port
+                    "Dashboard started{}",
+                    if requested_config.access_urls().is_empty() {
+                        format!(" at http://localhost:{}", requested_config.port)
+                    } else {
+                        "; open one of the private access URLs below".to_string()
+                    }
                 );
+                print_dashboard_access_urls(&requested_config);
             }
         }
         Err(e) => {
@@ -969,6 +1075,21 @@ fn run_dashboard_start(port: u16, allowed_origins: Option<&str>, json_mode: bool
             }
             exit(1);
         }
+    }
+}
+
+fn print_dashboard_access_urls(config: &DashboardConfig) {
+    let access_urls = config.access_urls();
+    if access_urls.is_empty() {
+        return;
+    }
+
+    eprintln!(
+        "{} Keep these reverse-proxy dashboard URLs private: they contain access tokens.",
+        color::warning_indicator()
+    );
+    for url in access_urls {
+        println!("{url}");
     }
 }
 
@@ -2077,19 +2198,18 @@ mod tests {
         let requested = DashboardConfig::new(
             4848,
             Some("https://second.example.com, https://dashboard.example.com"),
-        );
+        )
+        .unwrap();
         let equivalent = DashboardConfig::new(
             4848,
             Some("https://dashboard.example.com,https://second.example.com"),
-        );
-        let changed = DashboardConfig::new(4849, Some("https://dashboard.example.com"));
+        )
+        .unwrap();
+        let changed = DashboardConfig::new(4849, Some("https://dashboard.example.com")).unwrap();
 
-        assert_eq!(
-            dashboard_config_conflict(Some(&equivalent), &requested),
-            None
-        );
-        assert!(dashboard_config_conflict(Some(&changed), &requested).is_some());
-        assert!(dashboard_config_conflict(None, &requested).is_some());
+        assert_eq!(dashboard_config_issue(Some(&equivalent), &requested), None);
+        assert!(dashboard_config_issue(Some(&changed), &requested).is_some());
+        assert!(dashboard_config_issue(None, &requested).is_some());
     }
 
     #[test]

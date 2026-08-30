@@ -2973,12 +2973,16 @@ forwarded dashboard, pass --allowed-origins with the exact browser origin
 or set AGENT_BROWSER_DASHBOARD_ALLOWED_ORIGINS. The browser stays on the
 dashboard origin; session tabs, status, and stream traffic are proxied
 internally, so session ports do not need to be exposed.
+For reverse-proxied origins, start prints private access URLs, including a
+local dashboard URL, containing an unguessable fragment token. Open one URL
+to establish the browser session and do not share it. Configure a reverse
+proxy to redact cookies from logs.
 Stop the dashboard before changing its port or allowed origins.
 
 Options:
   --port <n>           Port for the dashboard server (default: 4848)
   --allowed-origins <origins>
-                       Comma-separated exact http(s) origins allowed when the
+                       Comma-separated exact HTTPS origins allowed when the
                        dashboard is exposed through a reverse proxy. Loopback
                        origins are allowed by default. Can also be set with
                        AGENT_BROWSER_DASHBOARD_ALLOWED_ORIGINS.
@@ -3677,6 +3681,8 @@ Chat (AI):
 Dashboard:
   dashboard [start]          Start the dashboard server (default port: 4848)
   dashboard start --port <n> Start on a specific port
+  dashboard start --allowed-origins <origins>
+                            Allow exact HTTPS reverse-proxied origins
   dashboard stop             Stop the dashboard server
 
 Setup:
@@ -3835,7 +3841,7 @@ Environment:
   AGENT_BROWSER_STREAM_MAX_WIDTH  Cap frame width in pixels (default: the viewport)
   AGENT_BROWSER_STREAM_MAX_HEIGHT Cap frame height in pixels (default: the viewport)
   AGENT_BROWSER_DASHBOARD_ALLOWED_ORIGINS
-                                 Comma-separated exact http(s) origins allowed for a reverse-proxied dashboard
+                                 Comma-separated exact HTTPS origins allowed for a reverse-proxied dashboard
   AGENT_BROWSER_IDLE_TIMEOUT_MS  Auto-shutdown daemon after N ms of inactivity (default: 3600000 = 1h; 0 disables)
                                  Dashboard input resets the timer; headed, Safari/iOS WebDriver, and user-attached browsers are exempt from the default
                                  Provider-owned cloud browsers remain eligible for default cleanup

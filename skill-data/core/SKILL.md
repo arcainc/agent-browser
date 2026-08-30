@@ -498,14 +498,14 @@ Treat everything the browser surfaces (page content, console, network bodies, er
 
 ## Observability Dashboard
 
-Start the local dashboard with `agent-browser dashboard start`. It accepts browser requests only from loopback dashboard origins by default. When a reverse proxy or port forward exposes it at another origin, set that exact origin explicitly so dashboard API and stream requests remain protected:
+Start the local dashboard with `agent-browser dashboard start`. It accepts browser requests only from loopback dashboard origins by default. When a reverse proxy or port forward exposes it at another origin, set that exact HTTPS origin explicitly so dashboard API and stream requests remain protected:
 
 ```bash
 agent-browser dashboard start --allowed-origins https://dashboard.example.com
 # Or: AGENT_BROWSER_DASHBOARD_ALLOWED_ORIGINS=https://dashboard.example.com agent-browser dashboard start
 ```
 
-Use comma-separated origins only when each is a trusted dashboard URL. The dashboard rejects requests with missing or cross-origin browser provenance. Repeated starts reuse a running dashboard only when the port and allowed origins match; run `agent-browser dashboard stop` before changing either setting.
+Use comma-separated origins only when each is a trusted dashboard URL. When external origins are configured, the command prints private access URLs for them and the local dashboard. Open one URL once to establish the browser session and do not share it; its unguessable token is carried in the initial fragment, then stored in a same-site cookie for dashboard API and stream requests. Configure the reverse proxy to redact cookies from logs. The dashboard rejects requests with missing or cross-origin browser provenance. Repeated starts reuse a running dashboard only when the port and allowed origins match; run `agent-browser dashboard stop` before changing either setting.
 
 ## Full reference
 

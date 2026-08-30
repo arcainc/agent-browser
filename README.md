@@ -1008,7 +1008,7 @@ agent-browser dashboard stop
 
 | Option | Description |
 |--------|-------------|
-| `--allowed-origins <origins>` | Comma-separated exact `http(s)` origins allowed to access a reverse-proxied dashboard. Loopback origins are always allowed. |
+| `--allowed-origins <origins>` | Comma-separated exact HTTPS origins allowed to access a reverse-proxied dashboard. Without this option, only loopback origins are accepted. |
 
 The dashboard runs as a standalone background process on port 4848, independent of browser sessions. It stays available even when no sessions are running. Local dashboard origins (`localhost`, `127.0.0.1`, and `[::1]`) work without configuration. If you expose it through a reverse proxy or forwarded URL, explicitly allow the browser origin so the server can reject cross-origin requests and DNS-rebinding attacks:
 
@@ -1017,7 +1017,7 @@ agent-browser dashboard start --allowed-origins https://dashboard.example.com
 # Or: AGENT_BROWSER_DASHBOARD_ALLOWED_ORIGINS=https://dashboard.example.com agent-browser dashboard start
 ```
 
-The browser stays on the dashboard origin; session-specific tabs, status, and stream traffic are proxied internally, so session ports do not need to be exposed.
+The command prints private access URLs for the allowed origins and local dashboard. Open one URL once to establish the browser session; it includes an unguessable access token in its fragment. The browser stores it in a same-site cookie, marked `Secure` when using HTTPS, for dashboard API and stream requests. Keep these URLs private and configure your reverse proxy to redact cookies from logs. The browser stays on the dashboard origin; session-specific tabs, status, and stream traffic are proxied internally, so session ports do not need to be exposed.
 
 Repeated starts with the same settings reuse the running dashboard. To change the port or allowed origins, run `agent-browser dashboard stop` before starting it with the new settings.
 

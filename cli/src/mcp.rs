@@ -1750,7 +1750,7 @@ fn parity_tools() -> Vec<Value> {
                 "port": { "type": "integer" },
                 "allowedOrigins": {
                     "type": "string",
-                    "description": "Comma-separated exact http(s) origins allowed to use a reverse-proxied dashboard. Local loopback origins are allowed by default."
+                    "description": "Comma-separated exact HTTPS origins allowed to use a reverse-proxied dashboard. Local loopback origins are allowed by default."
                 }
             }),
             &[],

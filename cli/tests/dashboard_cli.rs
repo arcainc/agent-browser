@@ -4,6 +4,9 @@ use serde_json::Value;
 use std::process::{Child, Command, Output, Stdio};
 use tempfile::TempDir;
 
+#[cfg(unix)]
+use std::os::unix::fs::PermissionsExt;
+
 const BIN: &str = env!("CARGO_BIN_EXE_agent-browser");
 
 struct DashboardCleanup<'a>(&'a TempDir);
@@ -42,6 +45,7 @@ fn seed_running_dashboard(tmp: &TempDir, port: u16, allowed_origins: &[&str]) ->
     let config = serde_json::json!({
         "port": port,
         "allowed_origins": allowed_origins,
+        "access_token": "a".repeat(64),
     });
     std::fs::write(
         socket_dir.join("dashboard.config"),
@@ -100,6 +104,20 @@ fn explicit_dashboard_start_accepts_mcp_style_arguments() {
         String::from_utf8_lossy(&started.stderr)
     );
     assert_eq!(json_output(&started)["data"]["port"], port);
+    let config: Value =
+        serde_json::from_slice(&std::fs::read(socket_dir(&tmp).join("dashboard.config")).unwrap())
+            .unwrap();
+    assert!(config["access_token"]
+        .as_str()
+        .is_some_and(|token| token.len() == 64));
+    assert_eq!(
+        std::fs::metadata(socket_dir(&tmp).join("dashboard.config"))
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777,
+        0o600
+    );
 }
 
 #[test]
