@@ -12,7 +12,8 @@ export function getDashboardApiPath(path: string): string {
 }
 
 const ACCESS_TOKEN_FRAGMENT_KEY = "dashboard-access-token";
-const ACCESS_TOKEN_COOKIE = "agent-browser-dashboard-token";
+const ACCESS_TOKEN_COOKIE = "__Host-agent-browser-dashboard-token";
+const LEGACY_ACCESS_TOKEN_COOKIE = "agent-browser-dashboard-token";
 
 /**
  * Reads the access token from a dashboard URL fragment and removes it from the
@@ -38,15 +39,20 @@ function getDashboardAccessToken(): string | null {
 let dashboardAccessToken: string | null | undefined;
 
 /**
- * Persist the token in a same-origin cookie so HTTP and WebSocket requests
- * authenticate without exposing it in request URLs or custom CORS headers.
+ * Persist external-dashboard tokens only in a Secure, host-bound cookie so
+ * HTTP and WebSocket requests authenticate without exposing the token in URLs.
+ * Loopback HTTP requests do not require a token.
  */
 export function initializeDashboardAccessToken(): void {
   dashboardAccessToken ??= getDashboardAccessToken();
-  if (dashboardAccessToken) {
-    const secure = window.location.protocol === "https:" ? "; Secure" : "";
-    document.cookie = `${ACCESS_TOKEN_COOKIE}=${encodeURIComponent(dashboardAccessToken)}; Path=/; SameSite=Strict${secure}`;
-  }
+  if (typeof window === "undefined") return;
+
+  // Remove cookies written by older dashboard builds. The legacy cookie was
+  // readable by every localhost port when created over plain HTTP.
+  document.cookie = `${LEGACY_ACCESS_TOKEN_COOKIE}=; Path=/; Max-Age=0; SameSite=Strict`;
+
+  if (!dashboardAccessToken || window.location.protocol !== "https:") return;
+  document.cookie = `${ACCESS_TOKEN_COOKIE}=${encodeURIComponent(dashboardAccessToken)}; Path=/; SameSite=Strict; Secure`;
 }
 
 /** Build the same-origin per-session tabs endpoint proxied through the dashboard. */

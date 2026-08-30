@@ -350,7 +350,7 @@ agent-browser dashboard start --allowed-origins https://dashboard.example.com
 agent-browser dashboard stop
 ```
 
-Loopback origins are allowed by default over IPv4 and IPv6. Set `--allowed-origins` or `AGENT_BROWSER_DASHBOARD_ALLOWED_ORIGINS` to a comma-separated list of exact HTTPS reverse-proxied origins. Every origin must be valid, and custom ports must be integers from 1 to 65535. Unknown options, missing values, invalid ports, and malformed origins fail without starting the server. The command prints private access URLs for external origins and the local dashboard; open one once to establish the browser session and do not share it. Repeated starts reuse the running dashboard only when the port and allowed origins match; stop it before changing either setting.
+Loopback origins are allowed by default over IPv4 and IPv6 without an access token. Set `--allowed-origins` or `AGENT_BROWSER_DASHBOARD_ALLOWED_ORIGINS` to a comma-separated list of exact HTTPS reverse-proxied origins. Every origin must be valid, and custom ports must be integers from 1 to 65535. Unknown options, missing values, invalid ports, and malformed origins fail without starting the server. The command prints private tokenized access URLs only for external origins; open the matching URL once to establish the browser session and do not share it. Open `http://localhost:<port>` directly for local access. Repeated starts reuse the running dashboard only when the port and allowed origins match; stop it before changing either setting.
 
 ## MCP Server
 

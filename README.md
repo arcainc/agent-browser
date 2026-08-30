@@ -1018,7 +1018,7 @@ agent-browser dashboard start --allowed-origins https://dashboard.example.com
 # Or: AGENT_BROWSER_DASHBOARD_ALLOWED_ORIGINS=https://dashboard.example.com agent-browser dashboard start
 ```
 
-The command prints private access URLs for the allowed origins and local dashboard. Open one URL once to establish the browser session; it includes an unguessable access token in its fragment. The browser stores it in a same-site cookie, marked `Secure` when using HTTPS, for dashboard API and stream requests. Keep these URLs private and configure your reverse proxy to redact cookies from logs. The browser stays on the dashboard origin; session-specific tabs, status, and stream traffic are proxied internally, so session ports do not need to be exposed.
+The command prints private access URLs only for the allowed external origins. Open the matching URL once to establish the browser session; it includes an unguessable access token in its fragment. The browser stores it in a Secure, host-bound, same-site cookie for dashboard API and stream requests. Keep these URLs private and configure your reverse proxy to redact cookies from logs. Loopback URLs do not require or receive this token, so open `http://localhost:<port>` directly for local access. The browser stays on the dashboard origin; session-specific tabs, status, and stream traffic are proxied internally, so session ports do not need to be exposed.
 
 Repeated starts with the same settings reuse the running dashboard. To change the port or allowed origins, run `agent-browser dashboard stop` before starting it with the new settings.
 

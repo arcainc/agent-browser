@@ -2968,15 +2968,15 @@ Running 'agent-browser dashboard' with no subcommand is equivalent to 'dashboard
 
 The dashboard runs as a standalone background process, independent of
 browser sessions. All sessions automatically stream to the dashboard.
-Loopback origins work without configuration. For a reverse-proxied or
+Loopback origins work without configuration or a token. For a reverse-proxied or
 forwarded dashboard, pass --allowed-origins with the exact browser origin
 or set AGENT_BROWSER_DASHBOARD_ALLOWED_ORIGINS. The browser stays on the
 dashboard origin; session tabs, status, and stream traffic are proxied
 internally, so session ports do not need to be exposed.
-For reverse-proxied origins, start prints private access URLs, including a
-local dashboard URL, containing an unguessable fragment token. Open one URL
-to establish the browser session and do not share it. Configure a reverse
-proxy to redact cookies from logs.
+For reverse-proxied origins, start prints private external access URLs
+containing an unguessable fragment token. Open the matching URL to establish
+the browser session and do not share it. Loopback URLs do not require or
+receive this token. Configure a reverse proxy to redact cookies from logs.
 Stop the dashboard before changing its port or allowed origins.
 
 Options:

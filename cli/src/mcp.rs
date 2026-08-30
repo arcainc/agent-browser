@@ -1745,7 +1745,7 @@ fn parity_tools() -> Vec<Value> {
         tool(
             TOOL_DASHBOARD_START,
             "Dashboard start",
-            "Start dashboard server. When the dashboard is exposed through a reverse proxy, configure its exact browser origin with allowedOrigins. Stop a running dashboard before changing its port or allowed origins.",
+            "Start dashboard server. Loopback access requires no token. When the dashboard is exposed through a reverse proxy, configure its exact browser origin with allowedOrigins and open the returned private URL. Stop a running dashboard before changing its port or allowed origins.",
             json!({
                 "port": { "type": "integer", "minimum": 1, "maximum": 65535 },
                 "allowedOrigins": {

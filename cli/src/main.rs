@@ -818,8 +818,6 @@ impl DashboardConfig {
         };
         self.allowed_origins
             .iter()
-            .cloned()
-            .chain(std::iter::once(format!("http://localhost:{}", self.port)))
             .map(|origin| format!("{origin}/#dashboard-access-token={token}"))
             .collect()
     }

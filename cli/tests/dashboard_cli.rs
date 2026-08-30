@@ -141,7 +141,16 @@ fn explicit_dashboard_start_accepts_mcp_style_arguments() {
         "dashboard start failed: {}",
         String::from_utf8_lossy(&started.stderr)
     );
-    assert_eq!(json_output(&started)["data"]["port"], port);
+    let payload = json_output(&started);
+    assert_eq!(payload["data"]["port"], port);
+    let access_urls = payload["data"]["access_urls"].as_array().unwrap();
+    assert_eq!(access_urls.len(), 1);
+    assert!(access_urls[0]
+        .as_str()
+        .is_some_and(|url| url.starts_with("https://dashboard.example.com/")));
+    assert!(access_urls
+        .iter()
+        .all(|url| !url.as_str().is_some_and(|url| url.contains("localhost"))));
     let config: Value =
         serde_json::from_slice(&std::fs::read(socket_dir(&tmp).join("dashboard.config")).unwrap())
             .unwrap();

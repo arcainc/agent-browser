@@ -43,7 +43,7 @@ impl DashboardProxyError {
 
 const PROXY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 const PROXY_MAX_RESPONSE_SIZE: u64 = 16 * 1024 * 1024;
-const DASHBOARD_ACCESS_TOKEN_COOKIE: &str = "agent-browser-dashboard-token";
+const DASHBOARD_ACCESS_TOKEN_COOKIE: &str = "__Host-agent-browser-dashboard-token";
 
 #[cfg(test)]
 static EXEC_CLI_INVOCATIONS: std::sync::atomic::AtomicUsize =
@@ -274,6 +274,18 @@ fn access_token_matches(request: &str) -> bool {
     let Ok(allowed_origins) = allowed_dashboard_origins() else {
         return false;
     };
+
+    // Same-origin validation runs before this check. Once it has established a
+    // loopback Host and loopback browser origin, no token is needed. In
+    // particular, never place the external dashboard credential in a cookie on
+    // plain-http localhost, where cookies are shared across ports.
+    if request_header_value(request, "host")
+        .map(normalize_host_authority)
+        .is_some_and(|host| is_loopback_authority(&host))
+    {
+        return true;
+    }
+
     if allowed_origins.is_empty() {
         return true;
     }
@@ -1213,6 +1225,39 @@ mod tests {
             1,
             "authenticated reverse-proxy request did not reach exec_cli"
         );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn loopback_dashboard_does_not_require_external_access_token() {
+        let guard = EnvGuard::new(&[
+            "AGENT_BROWSER_DASHBOARD_ALLOWED_ORIGINS",
+            "AGENT_BROWSER_DASHBOARD_ACCESS_TOKEN",
+        ]);
+        guard.set(
+            "AGENT_BROWSER_DASHBOARD_ALLOWED_ORIGINS",
+            "https://dashboard.example.com",
+        );
+        guard.set("AGENT_BROWSER_DASHBOARD_ACCESS_TOKEN", &"a".repeat(64));
+        EXEC_CLI_INVOCATIONS.store(0, std::sync::atomic::Ordering::SeqCst);
+        let body = r#"{"args":["--version"]}"#;
+        let request = format!(
+            "POST /api/exec HTTP/1.1\r\nHost: localhost:4848\r\nOrigin: http://localhost:4848\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}",
+            body.len(),
+        );
+
+        let response = send_request_to_dashboard_handler(&request).await;
+        assert!(
+            response.starts_with("HTTP/1.1 200 OK"),
+            "unexpected response: {response}"
+        );
+        assert_eq!(
+            EXEC_CLI_INVOCATIONS.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "tokenless loopback request did not reach exec_cli"
+        );
+
+        let websocket = "GET /api/session/9222/stream HTTP/1.1\r\nHost: localhost:4848\r\nOrigin: http://localhost:4848\r\nUpgrade: websocket\r\n\r\n";
+        assert!(is_authorized_dashboard_websocket_request(websocket));
     }
 
     #[test]
