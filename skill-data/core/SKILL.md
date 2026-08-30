@@ -505,7 +505,7 @@ agent-browser dashboard start --allowed-origins https://dashboard.example.com
 # Or: AGENT_BROWSER_DASHBOARD_ALLOWED_ORIGINS=https://dashboard.example.com agent-browser dashboard start
 ```
 
-Use comma-separated origins only when each is a trusted dashboard URL. The dashboard rejects requests with missing or cross-origin browser provenance.
+Use comma-separated origins only when each is a trusted dashboard URL. The dashboard rejects requests with missing or cross-origin browser provenance. Repeated starts reuse a running dashboard only when the port and allowed origins match; run `agent-browser dashboard stop` before changing either setting.
 
 ## Full reference
 

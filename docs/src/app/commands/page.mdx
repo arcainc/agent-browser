@@ -445,7 +445,7 @@ agent-browser dashboard start --allowed-origins <origins> # Allow exact reverse-
 agent-browser dashboard stop          # Stop the dashboard server
 ```
 
-Loopback dashboard origins are accepted by default. For a reverse-proxied or forwarded URL, pass its exact browser origin with `--allowed-origins` or set `AGENT_BROWSER_DASHBOARD_ALLOWED_ORIGINS`. The browser stays on the dashboard origin; per-session tabs, status, and stream traffic are proxied internally, so session ports do not need to be exposed.
+Loopback dashboard origins are accepted by default. For a reverse-proxied or forwarded URL, pass its exact browser origin with `--allowed-origins` or set `AGENT_BROWSER_DASHBOARD_ALLOWED_ORIGINS`. The browser stays on the dashboard origin; per-session tabs, status, and stream traffic are proxied internally, so session ports do not need to be exposed. Stop the running dashboard before changing its port or allowed origins.
 
 ## Doctor
 

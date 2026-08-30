@@ -17,7 +17,7 @@ Then open `http://localhost:4848` in your browser to see the live dashboard. If 
 agent-browser dashboard start --allowed-origins https://dashboard.example.com
 ```
 
-All sessions automatically stream to the dashboard. Local loopback origins are allowed automatically. For a reverse-proxied dashboard, use a comma-separated list of exact origins with `--allowed-origins` or `AGENT_BROWSER_DASHBOARD_ALLOWED_ORIGINS`; this lets the dashboard reject cross-origin requests and DNS-rebinding attacks. The browser stays on the dashboard origin while the server proxies per-session tabs, status, and stream traffic internally, so session ports do not need to be exposed.
+All sessions automatically stream to the dashboard. Local loopback origins are allowed automatically. For a reverse-proxied dashboard, use a comma-separated list of exact origins with `--allowed-origins` or `AGENT_BROWSER_DASHBOARD_ALLOWED_ORIGINS`; this lets the dashboard reject cross-origin requests and DNS-rebinding attacks. The browser stays on the dashboard origin while the server proxies per-session tabs, status, and stream traffic internally, so session ports do not need to be exposed. Repeated starts reuse the dashboard only when these settings match; stop it before changing the port or allowed origins.
 
 ### Custom stream port
 

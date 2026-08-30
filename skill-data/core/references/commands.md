@@ -341,6 +341,17 @@ agent-browser stream disable          # Stop it
 
 Clients connect to `ws://127.0.0.1:<port>` and receive `frame`, `status`, `tabs`, `url`, and `console` messages. They send `input_mouse`, `input_keyboard`, and `input_touch` to drive the page, `{"type":"config","maxFps":N}` (1 to 120, `0` = uncapped) to cap their own frame rate, and `{"type":"config","pacing":"ack"}` to receive one frame at a time, acknowledged with `{"type":"ack","seq":N}`. Both settings can be declared on the URL instead (`ws://127.0.0.1:<port>/?pacing=ack&maxFps=10`). See [streaming.md](streaming.md).
 
+## Observability Dashboard
+
+```bash
+agent-browser dashboard start
+agent-browser dashboard start --port 8080
+agent-browser dashboard start --allowed-origins https://dashboard.example.com
+agent-browser dashboard stop
+```
+
+Loopback origins are allowed by default. Set `--allowed-origins` or `AGENT_BROWSER_DASHBOARD_ALLOWED_ORIGINS` to a comma-separated list of exact reverse-proxied origins. Repeated starts reuse the running dashboard only when the port and allowed origins match; stop it before changing either setting.
+
 ## MCP Server
 
 ```bash

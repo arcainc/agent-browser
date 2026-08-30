@@ -1019,6 +1019,8 @@ agent-browser dashboard start --allowed-origins https://dashboard.example.com
 
 The browser stays on the dashboard origin; session-specific tabs, status, and stream traffic are proxied internally, so session ports do not need to be exposed.
 
+Repeated starts with the same settings reuse the running dashboard. To change the port or allowed origins, run `agent-browser dashboard stop` before starting it with the new settings.
+
 The dashboard displays:
 - **Live viewport**: real-time JPEG frames from the browser
 - **Activity feed**: chronological command/result stream with timing and expandable details

@@ -1745,7 +1745,7 @@ fn parity_tools() -> Vec<Value> {
         tool(
             TOOL_DASHBOARD_START,
             "Dashboard start",
-            "Start dashboard server. When the dashboard is exposed through a reverse proxy, configure its exact browser origin with allowedOrigins.",
+            "Start dashboard server. When the dashboard is exposed through a reverse proxy, configure its exact browser origin with allowedOrigins. Stop a running dashboard before changing its port or allowed origins.",
             json!({
                 "port": { "type": "integer" },
                 "allowedOrigins": {

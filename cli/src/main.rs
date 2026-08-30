@@ -764,28 +764,103 @@ fn get_dashboard_pid_path() -> std::path::PathBuf {
     get_socket_dir().join("dashboard.pid")
 }
 
+fn get_dashboard_config_path() -> std::path::PathBuf {
+    get_socket_dir().join("dashboard.config")
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
+struct DashboardConfig {
+    port: u16,
+    allowed_origins: Vec<String>,
+}
+
+impl DashboardConfig {
+    fn new(port: u16, allowed_origins: Option<&str>) -> Self {
+        Self {
+            port,
+            allowed_origins: native::stream::normalize_dashboard_allowed_origins(allowed_origins),
+        }
+    }
+
+    fn allowed_origins_description(&self) -> String {
+        if self.allowed_origins.is_empty() {
+            "loopback origins only".to_string()
+        } else {
+            self.allowed_origins.join(",")
+        }
+    }
+}
+
+fn read_dashboard_config() -> Option<DashboardConfig> {
+    let contents = fs::read_to_string(get_dashboard_config_path()).ok()?;
+    serde_json::from_str(&contents).ok()
+}
+
+fn remove_dashboard_sidecars() {
+    let _ = fs::remove_file(get_dashboard_pid_path());
+    let _ = fs::remove_file(get_dashboard_config_path());
+}
+
+fn dashboard_config_conflict(
+    running: Option<&DashboardConfig>,
+    requested: &DashboardConfig,
+) -> Option<String> {
+    let Some(running) = running else {
+        return Some(
+            "Dashboard is already running, but its configuration could not be verified. Run 'agent-browser dashboard stop' before starting it again."
+                .to_string(),
+        );
+    };
+    if running == requested {
+        return None;
+    }
+
+    Some(format!(
+        "Dashboard is already running with port {} and {}. Run 'agent-browser dashboard stop' before starting it with different settings.",
+        running.port,
+        running.allowed_origins_description()
+    ))
+}
+
 /// Start the dashboard and pass its explicit proxy-origin allowlist to the
 /// detached server process. This allowlist is deliberately separate from the
 /// request Host so DNS rebinding cannot grant an attacker-controlled origin.
+/// Persist the effective settings beside the PID so repeated starts cannot
+/// silently claim that a live process adopted different settings.
 fn run_dashboard_start(port: u16, allowed_origins: Option<&str>, json_mode: bool) {
     let pid_path = get_dashboard_pid_path();
+    let config_path = get_dashboard_config_path();
+    let requested_config = DashboardConfig::new(port, allowed_origins);
 
     // Check if already running
     if let Ok(pid_str) = fs::read_to_string(&pid_path) {
         if let Ok(pid) = pid_str.trim().parse::<u32>() {
             if is_pid_alive(pid) {
+                if let Some(error) =
+                    dashboard_config_conflict(read_dashboard_config().as_ref(), &requested_config)
+                {
+                    if json_mode {
+                        print_json_error(error);
+                    } else {
+                        eprintln!("{} {}", color::error_indicator(), error);
+                    }
+                    exit(1);
+                }
                 if json_mode {
                     print_json_value(json!({
                         "success": true,
-                        "data": { "port": port, "pid": pid, "already_running": true },
+                        "data": { "port": requested_config.port, "pid": pid, "already_running": true },
                     }));
                 } else {
-                    println!("Dashboard already running at http://localhost:{}", port);
+                    println!(
+                        "Dashboard already running at http://localhost:{}",
+                        requested_config.port
+                    );
                 }
                 return;
             }
         }
-        let _ = fs::remove_file(&pid_path);
+        remove_dashboard_sidecars();
     }
 
     let socket_dir = get_socket_dir();
@@ -810,10 +885,17 @@ fn run_dashboard_start(port: u16, allowed_origins: Option<&str>, json_mode: bool
     };
 
     let mut cmd = std::process::Command::new(&exe_path);
-    cmd.env("AGENT_BROWSER_DASHBOARD", "1")
-        .env("AGENT_BROWSER_DASHBOARD_PORT", port.to_string());
-    if let Some(allowed_origins) = allowed_origins {
-        cmd.env("AGENT_BROWSER_DASHBOARD_ALLOWED_ORIGINS", allowed_origins);
+    cmd.env("AGENT_BROWSER_DASHBOARD", "1").env(
+        "AGENT_BROWSER_DASHBOARD_PORT",
+        requested_config.port.to_string(),
+    );
+    if requested_config.allowed_origins.is_empty() {
+        cmd.env_remove("AGENT_BROWSER_DASHBOARD_ALLOWED_ORIGINS");
+    } else {
+        cmd.env(
+            "AGENT_BROWSER_DASHBOARD_ALLOWED_ORIGINS",
+            requested_config.allowed_origins.join(","),
+        );
     }
 
     #[cfg(unix)]
@@ -841,20 +923,41 @@ fn run_dashboard_start(port: u16, allowed_origins: Option<&str>, json_mode: bool
         .stderr(std::process::Stdio::null())
         .spawn()
     {
-        Ok(child) => {
+        Ok(mut child) => {
             let pid = child.id();
-            let _ = fs::write(&pid_path, pid.to_string());
+            let write_result = serde_json::to_vec(&requested_config)
+                .map_err(std::io::Error::other)
+                .and_then(|contents| fs::write(&config_path, contents))
+                .and_then(|()| fs::write(&pid_path, pid.to_string()));
+            if let Err(error) = write_result {
+                let _ = child.kill();
+                remove_dashboard_sidecars();
+                if json_mode {
+                    print_json_error(format!("Failed to save dashboard state: {error}"));
+                } else {
+                    eprintln!(
+                        "{} Failed to save dashboard state: {}",
+                        color::error_indicator(),
+                        error
+                    );
+                }
+                exit(1);
+            }
 
             if json_mode {
                 print_json_value(json!({
                     "success": true,
-                    "data": { "port": port, "pid": pid },
+                    "data": { "port": requested_config.port, "pid": pid },
                 }));
             } else {
-                println!("Dashboard started at http://localhost:{}", port);
+                println!(
+                    "Dashboard started at http://localhost:{}",
+                    requested_config.port
+                );
             }
         }
         Err(e) => {
+            remove_dashboard_sidecars();
             if json_mode {
                 print_json_error(format!("Failed to start dashboard: {}", e));
             } else {
@@ -875,6 +978,7 @@ fn run_dashboard_stop(json_mode: bool) {
     let pid_str = match fs::read_to_string(&pid_path) {
         Ok(s) => s,
         Err(_) => {
+            remove_dashboard_sidecars();
             if json_mode {
                 print_json_value(
                     json!({ "success": true, "data": { "stopped": false, "reason": "not running" } }),
@@ -889,7 +993,7 @@ fn run_dashboard_stop(json_mode: bool) {
     let pid: u32 = match pid_str.trim().parse() {
         Ok(p) => p,
         Err(_) => {
-            let _ = fs::remove_file(&pid_path);
+            remove_dashboard_sidecars();
             if json_mode {
                 print_json_value(
                     json!({ "success": true, "data": { "stopped": false, "reason": "invalid pid" } }),
@@ -918,7 +1022,7 @@ fn run_dashboard_stop(json_mode: bool) {
         }
     }
 
-    let _ = fs::remove_file(&pid_path);
+    remove_dashboard_sidecars();
 
     if json_mode {
         print_json_value(json!({ "success": true, "data": { "stopped": true } }));
@@ -1123,7 +1227,7 @@ fn main() {
                 run_dashboard_stop(flags.json);
                 return;
             }
-            Some(unknown) if !unknown.starts_with('-') => {
+            Some(unknown) if unknown != "start" && !unknown.starts_with('-') => {
                 eprintln!(
                     "{} Unknown dashboard subcommand: {}",
                     color::error_indicator(),
@@ -1967,6 +2071,26 @@ fn run_batch(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn dashboard_config_comparison_rejects_unknown_or_changed_settings() {
+        let requested = DashboardConfig::new(
+            4848,
+            Some("https://second.example.com, https://dashboard.example.com"),
+        );
+        let equivalent = DashboardConfig::new(
+            4848,
+            Some("https://dashboard.example.com,https://second.example.com"),
+        );
+        let changed = DashboardConfig::new(4849, Some("https://dashboard.example.com"));
+
+        assert_eq!(
+            dashboard_config_conflict(Some(&equivalent), &requested),
+            None
+        );
+        assert!(dashboard_config_conflict(Some(&changed), &requested).is_some());
+        assert!(dashboard_config_conflict(None, &requested).is_some());
+    }
 
     #[test]
     fn dashboard_allowed_origins_flag_is_removed_from_command_args() {

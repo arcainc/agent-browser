@@ -214,13 +214,23 @@ fn normalized_dashboard_allowed_origin(value: &str) -> Option<String> {
     normalized_dashboard_origin(value)
 }
 
-fn allowed_dashboard_origins() -> Vec<String> {
-    std::env::var("AGENT_BROWSER_DASHBOARD_ALLOWED_ORIGINS")
-        .ok()
+/// Normalize a comma-separated dashboard origin allowlist into the exact set
+/// enforced by the server. Sorting makes equivalent configurations stable for
+/// lifecycle comparisons in the parent CLI process.
+pub fn normalize_dashboard_allowed_origins(value: Option<&str>) -> Vec<String> {
+    let mut origins: Vec<String> = value
         .into_iter()
-        .flat_map(|value| value.split(',').map(str::to_owned).collect::<Vec<_>>())
+        .flat_map(|value| value.split(','))
         .filter_map(|origin| normalized_dashboard_allowed_origin(origin.trim()))
-        .collect()
+        .collect();
+    origins.sort();
+    origins.dedup();
+    origins
+}
+
+fn allowed_dashboard_origins() -> Vec<String> {
+    let configured = std::env::var("AGENT_BROWSER_DASHBOARD_ALLOWED_ORIGINS").ok();
+    normalize_dashboard_allowed_origins(configured.as_deref())
 }
 
 fn header_is_trusted_dashboard_origin(request: &str, header_name: &str) -> bool {
@@ -623,9 +633,7 @@ async fn handle_dashboard_connection(mut stream: tokio::net::TcpStream) {
             return;
         }
 
-        let response = format!(
-            "HTTP/1.1 204 No Content\r\nAccess-Control-Max-Age: 86400\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
-        );
+        let response = "HTTP/1.1 204 No Content\r\nAccess-Control-Max-Age: 86400\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
         let _ = stream.write_all(response.as_bytes()).await;
         return;
     }
@@ -1186,6 +1194,19 @@ mod tests {
         assert_eq!(
             normalize_origin_authority("http://attacker@localhost:4848"),
             None
+        );
+    }
+
+    #[test]
+    fn test_normalize_dashboard_allowed_origins_canonicalizes_a_set() {
+        assert_eq!(
+            normalize_dashboard_allowed_origins(Some(
+                "https://second.example.com, https://dashboard.example.com:443,https://second.example.com,invalid"
+            )),
+            vec![
+                "https://dashboard.example.com".to_string(),
+                "https://second.example.com".to_string()
+            ]
         );
     }
 

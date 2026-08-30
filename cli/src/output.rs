@@ -2973,6 +2973,7 @@ forwarded dashboard, pass --allowed-origins with the exact browser origin
 or set AGENT_BROWSER_DASHBOARD_ALLOWED_ORIGINS. The browser stays on the
 dashboard origin; session tabs, status, and stream traffic are proxied
 internally, so session ports do not need to be exposed.
+Stop the dashboard before changing its port or allowed origins.
 
 Options:
   --port <n>           Port for the dashboard server (default: 4848)
