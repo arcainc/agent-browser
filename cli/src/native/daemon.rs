@@ -1,3 +1,4 @@
+use fs2::FileExt;
 use serde_json::Value;
 use std::env;
 use std::fs;
@@ -28,9 +29,10 @@ pub async fn run_daemon(session: &str) {
         let _ = fs::create_dir_all(&socket_dir);
     }
 
-    // Claim ownership before creating or removing any session sidecar. An
-    // atomic create is portable and the pid in the marker lets a subsequent
-    // startup recover a lock left behind by a crashed owner.
+    // Claim ownership before creating or removing any session sidecar. The
+    // advisory lock, rather than the diagnostic PID in its contents, remains
+    // held for this daemon's entire lifetime so a reused PID cannot strand a
+    // stale endpoint or let another daemon replace a saturated live one.
     let owner_lock = match acquire_daemon_owner_lock(session) {
         Ok(Some(file)) => file,
         Ok(None) => return,
@@ -43,9 +45,9 @@ pub async fn run_daemon(session: &str) {
             return;
         }
     };
-    // Keep the marker handle open until final sidecar cleanup. The marker is
-    // created atomically, and its PID is visible before endpoint binding so
-    // callers never mistake a startup race for stale socket files.
+    // Keep the locked marker handle open until final sidecar cleanup. Its PID
+    // is visible before endpoint binding for diagnostics, but lock ownership
+    // is the only liveness authority.
     let _owner_lock = owner_lock;
 
     // When debug mode is on, redirect stderr to a log file so daemon
@@ -180,6 +182,9 @@ pub async fn run_daemon(session: &str) {
     let _ = fs::remove_file(socket_dir.join(format!("{}.provider", session)));
     let _ = fs::remove_file(socket_dir.join(format!("{}.extensions", session)));
     let _ = fs::remove_file(socket_dir.join(format!("{}.config", session)));
+    // All endpoints and owned resources are gone while `_owner_lock` still
+    // protects this inode, so removing the marker here cannot split ownership
+    // with a live daemon. A subsequent daemon creates and locks a fresh one.
     let _ = fs::remove_file(crate::connection::get_owner_lock_path(session));
 
     if let Err(e) = result {
@@ -192,26 +197,53 @@ fn acquire_daemon_owner_lock(session: &str) -> Result<Option<fs::File>, String> 
     use std::fs::OpenOptions;
 
     let path = crate::connection::get_owner_lock_path(session);
-    for _ in 0..2 {
-        match OpenOptions::new().write(true).create_new(true).open(&path) {
-            Ok(mut file) => {
-                file.write_all(process::id().to_string().as_bytes())
-                    .map_err(|error| error.to_string())?;
-                file.sync_data().map_err(|error| error.to_string())?;
-                return Ok(Some(file));
-            }
-            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
-                if crate::connection::daemon_owner_is_live(session) {
-                    return Ok(None);
-                }
-                // No live PID owns this marker. It can only be a crash
-                // leftover; remove precisely this session's lock and retry.
-                let _ = fs::remove_file(&path);
-            }
-            Err(error) => return Err(error.to_string()),
+    let (mut file, already_existed) = match OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create_new(true)
+        .open(&path)
+    {
+        Ok(file) => (file, false),
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => (
+            OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(&path)
+                .map_err(|error| error.to_string())?,
+            true,
+        ),
+        Err(error) => return Err(error.to_string()),
+    };
+    match file.try_lock_exclusive() {
+        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => return Ok(None),
+        Err(error) => return Err(error.to_string()),
+        Ok(()) => {}
+    }
+    if already_existed {
+        // `create_new` and `flock` are separate system calls. An empty marker
+        // that has just appeared belongs to a racing creator which has not
+        // yet locked it. Do not steal that startup window.
+        let marker_is_empty = fs::read_to_string(&path)
+            .map(|contents| contents.trim().is_empty())
+            .unwrap_or(false);
+        let recently_created = fs::metadata(&path)
+            .and_then(|metadata| metadata.modified())
+            .ok()
+            .and_then(|modified| modified.elapsed().ok())
+            .is_some_and(|age| age < Duration::from_secs(5));
+        if marker_is_empty && recently_created {
+            let _ = FileExt::unlock(&file);
+            return Ok(None);
         }
     }
-    Ok(None)
+    // An unlocked PID marker always belongs to a crashed former owner. PID
+    // liveness is deliberately ignored because the OS can reuse it for an
+    // unrelated process before a client reaches this recovery path.
+    file.set_len(0).map_err(|error| error.to_string())?;
+    file.write_all(process::id().to_string().as_bytes())
+        .map_err(|error| error.to_string())?;
+    file.sync_data().map_err(|error| error.to_string())?;
+    Ok(Some(file))
 }
 
 /// Idle timeout applied when AGENT_BROWSER_IDLE_TIMEOUT_MS is unset, so an

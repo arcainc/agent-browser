@@ -2065,9 +2065,14 @@ fn remember_active_provider_session(
 }
 
 async fn close_active_provider_session(state: &mut DaemonState) {
-    if let Some(active) = state.active_provider_session.take() {
+    // Keep the cleanup token in state until the provider acknowledges it. A
+    // normal command may be cancelled while this await is pending; retaining
+    // it lets the priority lifecycle close retry bounded provider cleanup
+    // instead of losing an allocated external browser on the dropped stack.
+    if let Some(active) = state.active_provider_session.clone() {
         providers::close_provider_session_with_plugins(&active.session, &active.plugins).await;
     }
+    state.active_provider_session = None;
     state.active_provider_connection = false;
 }
 
@@ -3609,10 +3614,13 @@ async fn auto_launch(
         // ios/safari are device providers handled via explicit launch command
         if !p.is_empty() && p != "ios" && p != "safari" {
             let conn = providers::connect_provider_with_plugins(&p, &plugins).await?;
+            // Register provider ownership before the first CDP await. A
+            // lifecycle close can cancel this command while WebSocket setup is
+            // blocked; keeping the cleanup token in daemon state ensures the
+            // priority teardown still releases an allocated cloud session.
+            remember_active_provider_session(state, conn.session.clone(), &plugins);
             if conn.direct_page && !allowed_domains.is_empty() {
-                if let Some(ref ps) = conn.session {
-                    providers::close_provider_session_with_plugins(ps, &plugins).await;
-                }
+                close_active_provider_session(state).await;
                 return Err(direct_page_allowed_domains_error());
             }
             let ws_headers = if p == "agentcore" {
@@ -3642,7 +3650,6 @@ async fn auto_launch(
                     state.reset_input_state();
                     state.browser = Some(mgr);
                     state.launch_hash = Some(hash);
-                    remember_active_provider_session(state, conn.session.clone(), &plugins);
                     state.subscribe_to_browser_events();
                     state.start_fetch_handler();
                     state.start_dialog_handler();
@@ -3655,9 +3662,7 @@ async fn auto_launch(
                     return Ok(());
                 }
                 Err(e) => {
-                    if let Some(ref ps) = conn.session {
-                        providers::close_provider_session_with_plugins(ps, &plugins).await;
-                    }
+                    close_active_provider_session(state).await;
                     return Err(format!("Provider '{}' connection failed: {}", p, e));
                 }
             }
@@ -4556,10 +4561,13 @@ async fn handle_launch(cmd: &Value, state: &mut DaemonState) -> Result<Value, St
                     Some(provider_plugin_launch_options_from_command(cmd)),
                 )
                 .await?;
+                // The provider allocation is now real even though CDP setup
+                // has not completed. Register it immediately so cancellation
+                // by a priority close cannot drop its cleanup token on the
+                // future's stack and strand a provider-owned browser.
+                remember_active_provider_session(state, conn.session.clone(), &command_plugins);
                 if conn.direct_page && !allowed_domains.is_empty() {
-                    if let Some(ref ps) = conn.session {
-                        providers::close_provider_session_with_plugins(ps, &command_plugins).await;
-                    }
+                    close_active_provider_session(state).await;
                     restore_domain_filter(state, &previous_domain_filter).await;
                     return Err(direct_page_allowed_domains_error());
                 }
@@ -4583,11 +4591,6 @@ async fn handle_launch(cmd: &Value, state: &mut DaemonState) -> Result<Value, St
                         state.reset_input_state();
                         state.browser = Some(mgr);
                         state.launch_hash = Some(new_hash);
-                        remember_active_provider_session(
-                            state,
-                            conn.session.clone(),
-                            &command_plugins,
-                        );
                         state.subscribe_to_browser_events();
                         state.start_fetch_handler();
                         state.start_dialog_handler();
@@ -4624,10 +4627,7 @@ async fn handle_launch(cmd: &Value, state: &mut DaemonState) -> Result<Value, St
                         );
                     }
                     Err(e) => {
-                        if let Some(ref ps) = conn.session {
-                            providers::close_provider_session_with_plugins(ps, &command_plugins)
-                                .await;
-                        }
+                        close_active_provider_session(state).await;
                         return Err(e);
                     }
                 }
@@ -13163,6 +13163,56 @@ printf '%s' '{"protocol":"agent-browser.plugin.v1","success":true,"data":{}}'
         let request = fs::read_to_string(request_path).unwrap();
         assert!(request.contains(r#""type":"browser.close""#));
         assert!(request.contains(r#""sessionId":"s1""#));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn lifecycle_close_releases_provider_registered_before_cdp_setup() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let request_path = dir.path().join("provider-lifecycle-close-request.json");
+        let plugin_path = dir.path().join("mock-provider-lifecycle-close");
+        fs::write(
+            &plugin_path,
+            r#"#!/bin/sh
+cat > "$1"
+printf '%s' '{"protocol":"agent-browser.plugin.v1","success":true,"data":{}}'
+"#,
+        )
+        .unwrap();
+        let mut perms = fs::metadata(&plugin_path).unwrap().permissions();
+        perms.set_mode(0o755);
+        fs::set_permissions(&plugin_path, perms).unwrap();
+
+        let mut state = DaemonState::new();
+        // This mirrors the window after a provider allocation has returned
+        // but before `BrowserManager::connect_cdp` has completed. A priority
+        // close must still find and release the token after it drops the
+        // blocked launch future.
+        remember_active_provider_session(
+            &mut state,
+            Some(providers::ProviderSession {
+                provider: "plugin:cloud-browser".to_string(),
+                session_id: r#"{"sessionId":"allocated-before-cdp"}"#.to_string(),
+            }),
+            &[crate::plugins::PluginConfig {
+                name: "cloud-browser".to_string(),
+                command: plugin_path.to_string_lossy().to_string(),
+                args: vec![request_path.to_string_lossy().to_string()],
+                capabilities: vec![crate::plugins::CAPABILITY_BROWSER_PROVIDER.to_string()],
+                ..crate::plugins::PluginConfig::default()
+            }],
+        );
+
+        let result = close_for_lifecycle(&mut state).await.unwrap();
+
+        assert_eq!(result["closed"], true);
+        assert!(state.active_provider_session.is_none());
+        assert!(!state.active_provider_connection);
+        let request = fs::read_to_string(request_path).unwrap();
+        assert!(request.contains(r#""type":"browser.close""#));
+        assert!(request.contains(r#""sessionId":"allocated-before-cdp""#));
     }
 
     #[test]

@@ -1,4 +1,5 @@
 use crate::validation::sanitize_session_component;
+use fs2::FileExt;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::env;
@@ -159,45 +160,102 @@ fn get_config_path(session: &str) -> PathBuf {
     get_socket_dir().join(format!("{}.config", session))
 }
 
-/// Lifetime ownership marker for a session daemon. A daemon creates this file
-/// before touching any endpoint sidecars and keeps its file handle until all
-/// listeners and browser resources are gone. It prevents a spawn-race loser
-/// or a client that sees a saturated endpoint from unlinking the winner.
+/// Lifetime ownership marker for a session daemon. A daemon holds an advisory
+/// exclusive lock on this file before touching endpoint sidecars and releases
+/// it only after its listener and browser resources are gone. The file's PID
+/// is diagnostic metadata, not the liveness authority: PIDs are reusable.
+/// The advisory lock prevents a spawn-race loser or a client that sees a
+/// saturated endpoint from unlinking a live winner.
 pub(crate) fn get_owner_lock_path(session: &str) -> PathBuf {
     get_socket_dir().join(format!("{}.lock", session))
 }
 
 pub(crate) fn daemon_owner_is_live(session: &str) -> bool {
     let path = get_owner_lock_path(session);
-    if fs::read_to_string(&path)
-        .ok()
-        .and_then(|pid| pid.trim().parse::<u32>().ok())
-        .is_some_and(is_pid_alive)
-    {
-        return true;
-    }
+    let file = match fs::OpenOptions::new().read(true).write(true).open(&path) {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return false,
+        // Do not remove a marker we cannot inspect. This is conservative for
+        // a daemon owned by a different user, and unlike a PID probe it cannot
+        // mistake an unrelated reused PID for the daemon.
+        Err(_) => return true,
+    };
 
-    // The daemon writes the PID immediately after an atomic create. During
-    // that tiny window, treating a fresh empty marker as stale would allow a
-    // second launcher to delete it and bind a competing endpoint. A later
-    // startup recovers a genuinely stale unparseable marker after this small
-    // startup grace period.
-    fs::metadata(path)
-        .and_then(|metadata| metadata.modified())
-        .ok()
-        .and_then(|modified| modified.elapsed().ok())
-        .is_some_and(|age| age < Duration::from_secs(5))
+    match file.try_lock_exclusive() {
+        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => true,
+        Err(_) => true,
+        Ok(()) => {
+            // A creator locks before writing its PID. Keep the short grace
+            // only for that empty startup marker, never for a PID marker:
+            // an unlocked marker containing a live unrelated PID is stale.
+            let marker_is_empty = fs::read_to_string(&path)
+                .map(|contents| contents.trim().is_empty())
+                .unwrap_or(false);
+            let recently_created = fs::metadata(&path)
+                .and_then(|metadata| metadata.modified())
+                .ok()
+                .and_then(|modified| modified.elapsed().ok())
+                .is_some_and(|age| age < Duration::from_secs(5));
+            let _ = FileExt::unlock(&file);
+            marker_is_empty && recently_created
+        }
+    }
+}
+
+/// Claim the session ownership lock briefly while inspecting or removing stale
+/// sidecars. This uses the same stable inode as the daemon lifetime lock, so
+/// cleanup cannot unlink a socket that a replacement daemon just bound.
+fn try_lock_owner_marker(session: &str) -> Result<Option<fs::File>, std::io::Error> {
+    let path = get_owner_lock_path(session);
+    let (file, already_existed) = match fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create_new(true)
+        .open(&path)
+    {
+        Ok(file) => (file, false),
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => (
+            fs::OpenOptions::new().read(true).write(true).open(&path)?,
+            true,
+        ),
+        Err(error) => return Err(error),
+    };
+    match file.try_lock_exclusive() {
+        Ok(()) => {
+            // `create` and `flock` cannot be one syscall. If a daemon won
+            // the atomic create immediately before us, leave its fresh empty
+            // marker alone until it has a chance to acquire the lock and
+            // write its diagnostic PID.
+            let marker_is_empty = fs::read_to_string(&path)
+                .map(|contents| contents.trim().is_empty())
+                .unwrap_or(false);
+            let recently_created = fs::metadata(&path)
+                .and_then(|metadata| metadata.modified())
+                .ok()
+                .and_then(|modified| modified.elapsed().ok())
+                .is_some_and(|age| age < Duration::from_secs(5));
+            if already_existed && marker_is_empty && recently_created {
+                let _ = FileExt::unlock(&file);
+                Ok(None)
+            } else {
+                Ok(Some(file))
+            }
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => Ok(None),
+        Err(error) => Err(error),
+    }
 }
 
 /// Clean up stale socket and PID files for a session
 pub fn cleanup_stale_files(session: &str) {
-    let lock_path = get_owner_lock_path(session);
-    if daemon_owner_is_live(session) {
+    let Ok(Some(_lock)) = try_lock_owner_marker(session) else {
         // A live owner may be between binding and accepting, or temporarily
         // saturated. Its sidecars are not stale just because a probe failed.
         return;
-    }
-    let _ = fs::remove_file(&lock_path);
+    };
+    // Hold the marker's lock while cleanup runs. Once every old endpoint is
+    // gone it is safe to remove this stale inode: a later daemon will create
+    // and lock a fresh marker only after this cleanup has finished.
     let pid_path = get_pid_path(session);
     let _ = fs::remove_file(&pid_path);
     let version_path = get_version_path(session);
@@ -218,6 +276,7 @@ pub fn cleanup_stale_files(session: &str) {
         let port_path = get_port_path(session);
         let _ = fs::remove_file(&port_path);
     }
+    let _ = fs::remove_file(get_owner_lock_path(session));
 }
 
 /// Remove sidecars only after the caller has verified that the daemon owner
@@ -225,7 +284,12 @@ pub fn cleanup_stale_files(session: &str) {
 /// unlike `cleanup_stale_files`, it must not be called while a live lock is
 /// present.
 fn cleanup_verified_dead_owner_files(session: &str) {
-    let _ = fs::remove_file(get_owner_lock_path(session));
+    let Ok(Some(_lock)) = try_lock_owner_marker(session) else {
+        return;
+    };
+    // Keep the advisory lock while the endpoints are removed, then remove
+    // this verified-dead marker so the next daemon starts with a clean owner
+    // sidecar rather than inheriting a stale diagnostic PID.
     let _ = fs::remove_file(get_pid_path(session));
     let _ = fs::remove_file(get_version_path(session));
     let _ = fs::remove_file(get_config_path(session));
@@ -237,6 +301,7 @@ fn cleanup_verified_dead_owner_files(session: &str) {
     let _ = fs::remove_file(get_socket_path(session));
     #[cfg(windows)]
     let _ = fs::remove_file(get_port_path(session));
+    let _ = fs::remove_file(get_owner_lock_path(session));
 }
 
 /// Returns whether a process with the given PID is currently alive.
@@ -321,8 +386,9 @@ pub fn read_session_version(session: &str) -> Option<String> {
 /// Walk the socket directory and classify each `.pid` / `.sock` entry.
 ///
 /// - Live daemons go into `sessions` with their `.version` file contents.
-/// - Stale entries (process gone, unreadable pid, orphaned `.sock`) are
-///   cleaned via [`cleanup_stale_files`] and recorded in `cleaned`.
+/// - Stale entries (released ownership lock, unreadable pid, orphaned
+///   `.sock`) are cleaned via [`cleanup_stale_files`] and recorded in
+///   `cleaned`. A PID is diagnostic only because it can be reused.
 /// - `dashboard.pid` lands in `dashboard` with liveness info; if the
 ///   process is gone, the pid file is removed and a `DashboardGone` entry
 ///   is added to `cleaned`.
@@ -379,7 +445,7 @@ pub fn walk_daemons() -> DaemonInventory {
             }
         };
 
-        if !is_pid_alive(pid) {
+        if !daemon_owner_is_live(&session_name) {
             cleanup_stale_files(&session_name);
             inventory.cleaned.push(CleanedSession {
                 name: session_name,
@@ -406,7 +472,7 @@ pub fn walk_daemons() -> DaemonInventory {
                     continue;
                 }
                 let pid_path = socket_dir.join(format!("{}.pid", session_name));
-                if !pid_path.exists() {
+                if !pid_path.exists() && !daemon_owner_is_live(session_name) {
                     cleanup_stale_files(session_name);
                     inventory.cleaned.push(CleanedSession {
                         name: session_name.to_string(),
@@ -1275,9 +1341,11 @@ mod tests {
         _guard.remove("XDG_RUNTIME_DIR");
 
         let result = get_socket_dir();
-        assert!(result.to_string_lossy().ends_with(".agent-browser"));
-        assert!(
-            result.to_string_lossy().contains("home") || result.to_string_lossy().contains("Users")
+        assert_eq!(
+            result,
+            dirs::home_dir()
+                .map(|home| home.join(".agent-browser"))
+                .unwrap_or_else(|| env::temp_dir().join("agent-browser"))
         );
     }
 
@@ -1323,12 +1391,22 @@ mod tests {
         let pid = std::process::id().to_string();
         fs::write(ns_one.join("current.pid"), &pid).unwrap();
         fs::write(ns_two.join("other.pid"), &pid).unwrap();
+        let owner_lock = fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(ns_one.join("current.lock"))
+            .unwrap();
+        owner_lock.try_lock_exclusive().unwrap();
 
         _guard.set("AGENT_BROWSER_NAMESPACE", "one");
         let inventory = walk_daemons();
 
         assert_eq!(inventory.sessions.len(), 1);
         assert_eq!(inventory.sessions[0].name, "current");
+
+        FileExt::unlock(&owner_lock).unwrap();
     }
 
     fn test_daemon_options<'a>(
@@ -1625,7 +1703,7 @@ mod tests {
     }
 
     #[test]
-    fn owner_lock_prevents_live_sidecar_cleanup() {
+    fn unlocked_owner_marker_with_reused_pid_is_stale() {
         let guard = EnvGuard::new(&["AGENT_BROWSER_SOCKET_DIR", "XDG_RUNTIME_DIR"]);
         let dir = tempfile::tempdir().unwrap();
         guard.set("AGENT_BROWSER_SOCKET_DIR", dir.path().to_str().unwrap());
@@ -1634,11 +1712,42 @@ mod tests {
 
         let session = "owned";
         let socket = get_socket_path(session);
+        // The current test process is certainly live, but this marker does
+        // not hold an advisory lock. It therefore models a crashed daemon
+        // whose numeric PID has since been reused by an unrelated process.
         fs::write(get_owner_lock_path(session), std::process::id().to_string()).unwrap();
         fs::write(&socket, "not-a-real-socket").unwrap();
         cleanup_stale_files(session);
+        assert!(!daemon_owner_is_live(session));
+        assert!(!socket.exists());
+        assert!(!get_owner_lock_path(session).exists());
+    }
+
+    #[test]
+    fn locked_owner_marker_prevents_live_sidecar_cleanup() {
+        let guard = EnvGuard::new(&["AGENT_BROWSER_SOCKET_DIR", "XDG_RUNTIME_DIR"]);
+        let dir = tempfile::tempdir().unwrap();
+        guard.set("AGENT_BROWSER_SOCKET_DIR", dir.path().to_str().unwrap());
+        guard.remove("XDG_RUNTIME_DIR");
+        fs::create_dir_all(get_socket_dir()).unwrap();
+
+        let session = "locked-owner";
+        let socket = get_socket_path(session);
+        let lock = fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(get_owner_lock_path(session))
+            .unwrap();
+        lock.try_lock_exclusive().unwrap();
+        fs::write(&socket, "not-a-real-socket").unwrap();
+
+        cleanup_stale_files(session);
+        assert!(daemon_owner_is_live(session));
         assert!(socket.exists());
-        assert!(get_owner_lock_path(session).exists());
+
+        FileExt::unlock(&lock).unwrap();
     }
 
     #[test]
