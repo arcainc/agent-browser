@@ -12,6 +12,8 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 #[cfg(unix)]
+use socket2::{Domain, Socket, Type};
+#[cfg(unix)]
 use std::os::unix::net::UnixStream;
 
 #[cfg(windows)]
@@ -157,8 +159,45 @@ fn get_config_path(session: &str) -> PathBuf {
     get_socket_dir().join(format!("{}.config", session))
 }
 
+/// Lifetime ownership marker for a session daemon. A daemon creates this file
+/// before touching any endpoint sidecars and keeps its file handle until all
+/// listeners and browser resources are gone. It prevents a spawn-race loser
+/// or a client that sees a saturated endpoint from unlinking the winner.
+pub(crate) fn get_owner_lock_path(session: &str) -> PathBuf {
+    get_socket_dir().join(format!("{}.lock", session))
+}
+
+pub(crate) fn daemon_owner_is_live(session: &str) -> bool {
+    let path = get_owner_lock_path(session);
+    if fs::read_to_string(&path)
+        .ok()
+        .and_then(|pid| pid.trim().parse::<u32>().ok())
+        .is_some_and(is_pid_alive)
+    {
+        return true;
+    }
+
+    // The daemon writes the PID immediately after an atomic create. During
+    // that tiny window, treating a fresh empty marker as stale would allow a
+    // second launcher to delete it and bind a competing endpoint. A later
+    // startup recovers a genuinely stale unparseable marker after this small
+    // startup grace period.
+    fs::metadata(path)
+        .and_then(|metadata| metadata.modified())
+        .ok()
+        .and_then(|modified| modified.elapsed().ok())
+        .is_some_and(|age| age < Duration::from_secs(5))
+}
+
 /// Clean up stale socket and PID files for a session
 pub fn cleanup_stale_files(session: &str) {
+    let lock_path = get_owner_lock_path(session);
+    if daemon_owner_is_live(session) {
+        // A live owner may be between binding and accepting, or temporarily
+        // saturated. Its sidecars are not stale just because a probe failed.
+        return;
+    }
+    let _ = fs::remove_file(&lock_path);
     let pid_path = get_pid_path(session);
     let _ = fs::remove_file(&pid_path);
     let version_path = get_version_path(session);
@@ -179,6 +218,25 @@ pub fn cleanup_stale_files(session: &str) {
         let port_path = get_port_path(session);
         let _ = fs::remove_file(&port_path);
     }
+}
+
+/// Remove sidecars only after the caller has verified that the daemon owner
+/// exited. Lifecycle fallback uses this after terminating the recorded owner;
+/// unlike `cleanup_stale_files`, it must not be called while a live lock is
+/// present.
+fn cleanup_verified_dead_owner_files(session: &str) {
+    let _ = fs::remove_file(get_owner_lock_path(session));
+    let _ = fs::remove_file(get_pid_path(session));
+    let _ = fs::remove_file(get_version_path(session));
+    let _ = fs::remove_file(get_config_path(session));
+    let _ = fs::remove_file(get_socket_dir().join(format!("{}.stream", session)));
+    let _ = fs::remove_file(get_socket_dir().join(format!("{}.engine", session)));
+    let _ = fs::remove_file(get_socket_dir().join(format!("{}.provider", session)));
+    let _ = fs::remove_file(get_socket_dir().join(format!("{}.extensions", session)));
+    #[cfg(unix)]
+    let _ = fs::remove_file(get_socket_path(session));
+    #[cfg(windows)]
+    let _ = fs::remove_file(get_port_path(session));
 }
 
 /// Returns whether a process with the given PID is currently alive.
@@ -405,7 +463,7 @@ pub fn daemon_ready(session: &str) -> bool {
     #[cfg(unix)]
     {
         let socket_path = get_socket_path(session);
-        UnixStream::connect(&socket_path).is_ok()
+        connect_unix_timeout(&socket_path, Duration::from_millis(100)).is_ok()
     }
     #[cfg(windows)]
     {
@@ -714,14 +772,8 @@ fn daemon_version_matches(session: &str) -> bool {
 
 /// Kill a running daemon by reading its PID file and sending a kill signal.
 fn kill_stale_daemon(session: &str) {
-    // Remove the socket first so no new connections reach the old daemon
-    #[cfg(unix)]
-    {
-        let socket_path = get_socket_path(session);
-        let _ = fs::remove_file(&socket_path);
-    }
-
     let pid_path = get_pid_path(session);
+    let mut stopped = true;
     if let Ok(pid_str) = fs::read_to_string(&pid_path) {
         if let Ok(pid) = pid_str.trim().parse::<u32>() {
             #[cfg(unix)]
@@ -753,11 +805,16 @@ fn kill_stale_daemon(session: &str) {
                     .status();
                 thread::sleep(Duration::from_millis(500));
             }
+            stopped = !is_pid_alive(pid);
         }
     }
 
-    // Clean up leftover files regardless
-    cleanup_stale_files(session);
+    // Do not unlink a listener before stopping its verified owner. A live but
+    // saturated daemon must keep its endpoint and lock so no second daemon can
+    // bind a new inode for the same session.
+    if stopped && !daemon_owner_is_live(session) {
+        cleanup_verified_dead_owner_files(session);
+    }
 }
 
 fn wait_for_daemon_exit(session: &str, timeout: Duration) -> bool {
@@ -821,6 +878,13 @@ pub fn ensure_daemon(session: &str, opts: &DaemonOptions) -> Result<DaemonResult
                 }
             }
         }
+    }
+
+    if daemon_owner_is_live(session) {
+        return Err(format!(
+            "Daemon owner for session '{}' exists but its control endpoint is busy or unresponsive. Retry the command or use close to recover the session.",
+            session
+        ));
     }
 
     // Clean up any stale socket/pid files before starting fresh
@@ -997,7 +1061,7 @@ fn connect(session: &str) -> Result<Connection, String> {
     #[cfg(unix)]
     {
         let socket_path = get_socket_path(session);
-        UnixStream::connect(&socket_path)
+        connect_unix_timeout(&socket_path, Duration::from_secs(1))
             .map(Connection::Unix)
             .map_err(|e| format!("Failed to connect: {}", e))
     }
@@ -1010,8 +1074,18 @@ fn connect(session: &str) -> Result<Connection, String> {
     }
 }
 
+#[cfg(unix)]
+fn connect_unix_timeout(path: &std::path::Path, timeout: Duration) -> std::io::Result<UnixStream> {
+    let socket = Socket::new(Domain::UNIX, Type::STREAM, None)?;
+    socket.connect_timeout(&socket2::SockAddr::unix(path)?, timeout)?;
+    socket.set_nonblocking(false)?;
+    Ok(socket.into())
+}
+
 pub fn send_command(cmd: Value, session: &str) -> Result<Response, String> {
-    // Retry logic for transient errors (EAGAIN/EWOULDBLOCK/connection issues)
+    // Retrying after a write or read timeout can replay a non-idempotent
+    // browser action. Only failures known to happen before dispatch are safe
+    // to retry against the same daemon.
     const MAX_RETRIES: u32 = 5;
     const RETRY_DELAY_MS: u64 = 200;
 
@@ -1024,13 +1098,12 @@ pub fn send_command(cmd: Value, session: &str) -> Result<Response, String> {
 
         match send_command_once(&cmd, session) {
             Ok(response) => return Ok(response),
-            Err(e) => {
-                if is_transient_error(&e) {
-                    last_error = e;
+            Err(error) => {
+                if !error.dispatched && is_transient_error(&error.message) {
+                    last_error = error.message;
                     continue;
                 }
-                // Non-transient error, fail immediately
-                return Err(e);
+                return Err(error.message);
             }
         }
     }
@@ -1082,12 +1155,11 @@ fn has_os_error(error: &str, code: u32) -> bool {
     error.contains(&format!("(os error {})", code))
 }
 
-/// Socket read timeout for one request. Ordinary commands get a 30s floor.
-/// Commands carrying an operation timeout (the wait family, which
-/// parse_command stamps with AGENT_BROWSER_DEFAULT_TIMEOUT when no explicit
-/// --timeout is given) get that timeout plus margin, so the daemon can report
-/// a proper operation timeout instead of the client dying with EAGAIN at 30s
-/// and the retry loop re-sending the whole long-running command.
+/// End-to-end read budget for one dispatched request. Ordinary commands get a
+/// 30s floor. Commands carrying an operation timeout get that timeout plus a
+/// margin so the daemon can report a proper operation result. A read timeout
+/// is deliberately not retried: the daemon may already have performed a
+/// non-idempotent browser action.
 ///
 /// The env var is deliberately NOT consulted here. Reading it would apply a
 /// long wait budget to every command, so a genuinely hung daemon on a simple
@@ -1100,26 +1172,47 @@ fn read_timeout_for(cmd: &Value) -> Duration {
     Duration::from_millis(op_ms.saturating_add(10_000).max(30_000))
 }
 
-fn send_command_once(cmd: &Value, session: &str) -> Result<Response, String> {
-    let mut stream = connect(session)?;
+struct DispatchError {
+    message: String,
+    dispatched: bool,
+}
+
+fn send_command_once(cmd: &Value, session: &str) -> Result<Response, DispatchError> {
+    let mut stream = connect(session).map_err(|message| DispatchError {
+        message,
+        dispatched: false,
+    })?;
 
     stream.set_read_timeout(Some(read_timeout_for(cmd))).ok();
     stream.set_write_timeout(Some(Duration::from_secs(5))).ok();
 
-    let mut json_str = serde_json::to_string(cmd).map_err(|e| e.to_string())?;
+    let mut json_str = serde_json::to_string(cmd).map_err(|e| DispatchError {
+        message: e.to_string(),
+        dispatched: false,
+    })?;
     json_str.push('\n');
 
     stream
         .write_all(json_str.as_bytes())
-        .map_err(|e| format!("Failed to send: {}", e))?;
+        .map_err(|e| DispatchError {
+            message: format!("Failed to send: {}", e),
+            // A partial write may already have been received and dispatched.
+            dispatched: true,
+        })?;
 
     let mut reader = BufReader::new(stream);
     let mut response_line = String::new();
     reader
         .read_line(&mut response_line)
-        .map_err(|e| format!("Failed to read: {}", e))?;
+        .map_err(|e| DispatchError {
+            message: format!("Failed to read: {}", e),
+            dispatched: true,
+        })?;
 
-    serde_json::from_str(&response_line).map_err(|e| format!("Invalid response: {}", e))
+    serde_json::from_str(&response_line).map_err(|e| DispatchError {
+        message: format!("Invalid response: {}", e),
+        dispatched: true,
+    })
 }
 
 #[cfg(test)]
@@ -1509,6 +1602,43 @@ mod tests {
         assert!(!is_transient_error("Invalid JSON syntax"));
         assert!(!is_transient_error("Permission denied"));
         assert!(!is_transient_error("Daemon not found"));
+    }
+
+    #[test]
+    fn dispatched_failures_are_not_retryable() {
+        let read_timeout = DispatchError {
+            message: "Failed to read: Resource temporarily unavailable (os error 11)".to_string(),
+            dispatched: true,
+        };
+        assert!(is_transient_error(&read_timeout.message));
+        assert!(
+            read_timeout.dispatched,
+            "read timeouts may follow a browser action"
+        );
+
+        let connect_failure = DispatchError {
+            message: "Failed to connect: Connection refused (os error 111)".to_string(),
+            dispatched: false,
+        };
+        assert!(!connect_failure.dispatched);
+        assert!(daemon_unreachable(&connect_failure.message));
+    }
+
+    #[test]
+    fn owner_lock_prevents_live_sidecar_cleanup() {
+        let guard = EnvGuard::new(&["AGENT_BROWSER_SOCKET_DIR", "XDG_RUNTIME_DIR"]);
+        let dir = tempfile::tempdir().unwrap();
+        guard.set("AGENT_BROWSER_SOCKET_DIR", dir.path().to_str().unwrap());
+        guard.remove("XDG_RUNTIME_DIR");
+        fs::create_dir_all(get_socket_dir()).unwrap();
+
+        let session = "owned";
+        let socket = get_socket_path(session);
+        fs::write(get_owner_lock_path(session), std::process::id().to_string()).unwrap();
+        fs::write(&socket, "not-a-real-socket").unwrap();
+        cleanup_stale_files(session);
+        assert!(socket.exists());
+        assert!(get_owner_lock_path(session).exists());
     }
 
     #[test]

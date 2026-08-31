@@ -2093,6 +2093,46 @@ pub(crate) async fn close_current_browser(state: &mut DaemonState) -> Result<(),
     Ok(())
 }
 
+/// Drop every daemon-owned browser resource without waiting for a renderer or
+/// WebDriver endpoint. This is only used after lifecycle shutdown has already
+/// cancelled normal command execution. In particular, an attached CDP browser
+/// is disconnected but never terminated; `BrowserManager::force_close` kills
+/// only a process the daemon launched itself.
+async fn force_close_current_browser(state: &mut DaemonState) {
+    if let Some(mut mgr) = state.browser.take() {
+        mgr.force_close().await;
+    }
+
+    // Provider plugins are external processes and can themselves be wedged.
+    // Best effort cleanup is useful, but it must never keep the session alive.
+    let active_provider = state.active_provider_session.take();
+    state.active_provider_connection = false;
+    if let Some(active) = active_provider {
+        let _ = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            providers::close_provider_session_with_plugins(&active.session, &active.plugins),
+        )
+        .await;
+    }
+
+    state.launch_hash = None;
+    state.network_auto_attach_installed = false;
+    state.event_rx = None;
+    state.iframe_sessions.clear();
+    state.active_iframe_sessions.clear();
+    state.active_frame_id = None;
+    state.screencasting = false;
+    state.pending_dialog = None;
+    state.reset_input_state();
+    if let Some(task) = state.fetch_handler_task.take() {
+        task.abort();
+    }
+    if let Some(task) = state.dialog_handler_task.take() {
+        task.abort();
+    }
+    state.update_stream_client().await;
+}
+
 /// Close every browser backend owned by the daemon.
 ///
 /// Lifecycle shutdown paths use this instead of `close_current_browser`
@@ -2115,6 +2155,41 @@ pub(crate) async fn close_all_browser_backends(state: &mut DaemonState) -> Resul
     state.backend_type = BackendType::Cdp;
 
     close_result
+}
+
+/// Force all backend variants into a detached state. This deliberately avoids
+/// unbounded protocol and HTTP shutdown calls after graceful shutdown timed
+/// out, and clears the mutable sidecar state that a cancelled command could
+/// otherwise leave behind.
+pub(crate) async fn force_close_all_browser_backends(state: &mut DaemonState) {
+    if let Some(tx) = state.recording_state.cancel_tx.take() {
+        let _ = tx.send(());
+    }
+    if let Some(task) = state.recording_state.capture_task.take() {
+        task.abort();
+    }
+    state.recording_state.shared_frame_count = None;
+    state.recording_state.active = false;
+    force_close_current_browser(state).await;
+
+    if let Some(mut webdriver) = state.webdriver_backend.take() {
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(2), webdriver.close()).await;
+    }
+    if let Some(mut appium) = state.appium.take() {
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(2), appium.close()).await;
+    }
+    if let Some(mut driver) = state.safari_driver.take() {
+        driver.kill();
+    }
+    state.backend_type = BackendType::Cdp;
+    state.ref_map.clear();
+    {
+        let mut headers = state.origin_headers.write().await;
+        headers.clear();
+    }
+    if let Some(server) = state.inspect_server.take() {
+        server.shutdown();
+    }
 }
 
 async fn close_after_network_control_failure(
@@ -4922,42 +4997,94 @@ async fn handle_evaluate(cmd: &Value, state: &DaemonState) -> Result<Value, Stri
 }
 
 async fn handle_close(state: &mut DaemonState) -> Result<Value, String> {
-    let save_result = auto_save_restore_state(state).await;
-    close_all_browser_backends(state).await?;
+    close_for_lifecycle(state).await
+}
 
-    // Stop background Fetch handler
+/// Gracefully save and close a session within one lifecycle budget, then
+/// force-detach owned resources if a renderer, provider, or WebDriver endpoint
+/// stops responding. Transactional state saves preserve the previous snapshot
+/// on failure, so reporting `saveError` never replaces valid restore state.
+pub(crate) async fn close_for_lifecycle(state: &mut DaemonState) -> Result<Value, String> {
+    const LIFECYCLE_GRACEFUL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
+    let graceful = async {
+        // This cancels an in-flight captureScreenshot before touching the
+        // browser. Its own deadline makes recording unable to extend the
+        // lifecycle budget if ffmpeg is unhealthy.
+        let _ = state.stop_recording_task().await;
+        state.recording_state.active = false;
+        let save_result = auto_save_restore_state(state).await;
+        let close_result = close_all_browser_backends(state).await;
+        (save_result, close_result)
+    };
+    let (save_result, close_error) = match tokio::time::timeout(
+        LIFECYCLE_GRACEFUL_TIMEOUT,
+        graceful,
+    )
+    .await
+    {
+        Ok((save_result, close_result)) => (save_result, close_result.err()),
+        Err(_) => {
+            force_close_all_browser_backends(state).await;
+            (
+                Err("Timed out while saving or closing the browser; previous restore state was kept".to_string()),
+                None,
+            )
+        }
+    };
+
+    // These are daemon-owned tasks, not browser protocol calls. Stop them in
+    // both graceful and forced paths so no cancelled command can keep a CDP
+    // connection or sidecar state alive.
     if let Some(task) = state.fetch_handler_task.take() {
+        task.abort();
+    }
+    if let Some(task) = state.dialog_handler_task.take() {
         task.abort();
     }
     {
         let mut map = state.origin_headers.write().await;
         map.clear();
     }
-
     if let Some(server) = state.inspect_server.take() {
         server.shutdown();
     }
-
     state.ref_map.clear();
-    match save_result {
-        Ok(Some(path)) => Ok(json!({
+
+    let close_error = if let Some(err) = close_error {
+        // `close_current_browser` has already detached the manager; complete
+        // the hard cleanup but still return a terminal close result. Leaving
+        // the daemon alive after resources were detached would make recovery
+        // less reliable than the original failure.
+        force_close_all_browser_backends(state).await;
+        Some(err)
+    } else {
+        None
+    };
+
+    let mut result = match save_result {
+        Ok(Some(path)) => json!({
             "closed": true,
             "restoreStatus": state.restore_status,
             "saveStatus": state.restore_save_status,
             "statePath": path
-        })),
-        Ok(None) => Ok(json!({
+        }),
+        Ok(None) => json!({
             "closed": true,
             "restoreStatus": state.restore_status,
             "saveStatus": state.restore_save_status
-        })),
-        Err(err) => Ok(json!({
+        }),
+        Err(err) => json!({
             "closed": true,
             "restoreStatus": state.restore_status,
             "saveStatus": state.restore_save_status,
             "saveError": err
-        })),
+        }),
+    };
+    if let Some(error) = close_error {
+        result["closeError"] = json!(error);
     }
+    Ok(result)
 }
 
 // ---------------------------------------------------------------------------
@@ -6952,13 +7079,16 @@ async fn handle_recording_start(cmd: &Value, state: &mut DaemonState) -> Result<
 }
 
 async fn handle_recording_stop(state: &mut DaemonState) -> Result<Value, String> {
-    state.stop_recording_task().await?;
+    let stop_error = state.stop_recording_task().await.err();
     let result = recording::recording_stop(&mut state.recording_state);
 
     if let Some(ref server) = state.stream_server {
         server.set_recording(false, &state.engine).await;
     }
 
+    if let Some(error) = stop_error {
+        return Err(error);
+    }
     result
 }
 
@@ -7664,7 +7794,9 @@ async fn handle_react_suspense(cmd: &Value, state: &DaemonState) -> Result<Value
             Ok(json!({ "boundaries": boundaries_json }))
         }
     } else {
-        Ok(json!({ "report": react::format_suspense_report(&boundaries, only_dynamic) }))
+        Ok(json!({
+            "report": react::format_suspense_report(&boundaries, only_dynamic)
+        }))
     }
 }
 
@@ -11078,10 +11210,23 @@ async fn handle_auth_login(cmd: &Value, state: &mut DaemonState) -> Result<Value
 // ---------------------------------------------------------------------------
 
 async fn handle_confirm(_cmd: &Value, state: &mut DaemonState) -> Result<Value, String> {
-    let pending = state
+    let expected = state
         .pending_confirmation
-        .take()
+        .as_ref()
+        .and_then(|pending| pending.cmd.get("id"))
+        .and_then(Value::as_str)
         .ok_or("No pending confirmation")?;
+    // Legacy direct protocol callers omitted confirmationId. The CLI has
+    // always supplied it; accept omission only when there is one pending
+    // action, while rejecting an explicitly mismatched identity.
+    let supplied = _cmd
+        .get("confirmationId")
+        .and_then(Value::as_str)
+        .unwrap_or(expected);
+    if supplied != expected {
+        return Err("Confirmation ID does not match the pending action".to_string());
+    }
+    let pending = state.pending_confirmation.take().expect("checked above");
 
     let mut approved_actions = pending.approved_actions.clone();
     if !approved_actions.iter().any(|a| a == &pending.action) {
@@ -11098,10 +11243,20 @@ async fn handle_confirm(_cmd: &Value, state: &mut DaemonState) -> Result<Value, 
 }
 
 async fn handle_deny(_cmd: &Value, state: &mut DaemonState) -> Result<Value, String> {
-    let pending = state
+    let expected = state
         .pending_confirmation
-        .take()
+        .as_ref()
+        .and_then(|pending| pending.cmd.get("id"))
+        .and_then(Value::as_str)
         .ok_or("No pending confirmation")?;
+    let supplied = _cmd
+        .get("confirmationId")
+        .and_then(Value::as_str)
+        .unwrap_or(expected);
+    if supplied != expected {
+        return Err("Confirmation ID does not match the pending action".to_string());
+    }
+    let pending = state.pending_confirmation.take().expect("checked above");
 
     Ok(json!({ "denied": true, "action": pending.action }))
 }
