@@ -1,8 +1,30 @@
 # agent-browser
 
-## 0.35.2
+## 0.35.3
 
 <!-- release:start -->
+### Security
+
+- Updated transitive **brace-expansion dependencies** to patched releases, including the associated `minimatch` updates (#1752)
+
+### Bug Fixes
+
+- Fixed **Lightpanda startup** by removing the obsolete `--timeout` option from the `lightpanda serve` command (#1750)
+
+### Improvements
+
+- Upgraded the **Eve integration** to 0.47.3, raised its peer compatibility floor, and updated the example app for the current Eve agent API (#1751)
+
+### Contributors
+
+- @ctate
+- @anupamme
+- @arrufat
+
+<!-- release:end -->
+
+## 0.35.2
+
 ### Security
 
 - Hardened **dashboard origin validation and reverse-proxy access** with same-origin provenance enforcement that defends against DNS rebinding, form/header smuggling, and cross-origin requests. Reverse-proxied origins now require exact HTTPS allowlisting and generated token authentication, while tokenless IPv4 and IPv6 loopback access remains supported. Dashboard options are validated strictly, and CLI and MCP lifecycle behavior is aligned (#1738)
@@ -15,8 +37,6 @@
 
 - @ctate
 - @Railly
-
-<!-- release:end -->
 
 ## 0.35.1
 
