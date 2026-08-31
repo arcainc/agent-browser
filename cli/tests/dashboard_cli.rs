@@ -157,6 +157,7 @@ fn explicit_dashboard_start_accepts_mcp_style_arguments() {
     assert!(config["access_token"]
         .as_str()
         .is_some_and(|token| token.len() == 64));
+    #[cfg(unix)]
     assert_eq!(
         std::fs::metadata(socket_dir(&tmp).join("dashboard.config"))
             .unwrap()

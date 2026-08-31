@@ -146,8 +146,13 @@ fn normalize_origin_authority(origin: &str) -> Option<String> {
     })
 }
 
-fn normalize_host_authority(host: &str) -> String {
+fn normalize_host_authority(host: &str, scheme: Option<&str>) -> String {
     let host = host.trim().to_ascii_lowercase();
+    let default_port = match scheme {
+        Some("http") => Some("80"),
+        Some("https") => Some("443"),
+        _ => None,
+    };
 
     if let Some(bracket_end) = host.rfind(']') {
         if bracket_end == host.len() - 1 {
@@ -156,7 +161,7 @@ fn normalize_host_authority(host: &str) -> String {
 
         if host.as_bytes().get(bracket_end + 1) == Some(&b':') {
             let port = &host[bracket_end + 2..];
-            if port == "80" || port == "443" {
+            if Some(port) == default_port {
                 return host[..=bracket_end].to_string();
             }
         }
@@ -165,7 +170,7 @@ fn normalize_host_authority(host: &str) -> String {
     }
 
     if let Some((name, port)) = host.rsplit_once(':') {
-        if !name.contains(':') && (port == "80" || port == "443") {
+        if !name.contains(':') && Some(port) == default_port {
             return name.to_string();
         }
     }
@@ -280,7 +285,7 @@ fn access_token_matches(request: &str) -> bool {
     // particular, never place the external dashboard credential in a cookie on
     // plain-http localhost, where cookies are shared across ports.
     if request_header_value(request, "host")
-        .map(normalize_host_authority)
+        .map(|host| normalize_host_authority(host, None))
         .is_some_and(|host| is_loopback_authority(&host))
     {
         return true;
@@ -320,7 +325,12 @@ fn header_is_trusted_dashboard_origin(request: &str, header_name: &str) -> bool 
     else {
         return false;
     };
-    let Some(host) = request_header_value(request, "host").map(normalize_host_authority) else {
+    let Some((scheme, _)) = origin.split_once("://") else {
+        return false;
+    };
+    let Some(host) = request_header_value(request, "host")
+        .map(|host| normalize_host_authority(host, Some(scheme)))
+    else {
         return false;
     };
 
@@ -341,7 +351,7 @@ fn is_same_origin_ws_request(request: &str) -> bool {
         header_is_trusted_dashboard_origin(request, "origin")
     } else {
         request_header_value(request, "host")
-            .map(normalize_host_authority)
+            .map(|host| normalize_host_authority(host, None))
             .is_some_and(|host| is_loopback_authority(&host))
     }
 }
@@ -1446,6 +1456,30 @@ mod tests {
             "GET /api/session/9222/stream HTTP/1.1\r\nHost: dashboard.agent-browser.localhost:443\r\nOrigin: https://dashboard.agent-browser.localhost\r\nCookie: {DASHBOARD_ACCESS_TOKEN_COOKIE}={token}\r\nUpgrade: websocket\r\n\r\n"
         );
         assert!(is_authorized_dashboard_websocket_request(&req));
+    }
+
+    #[test]
+    fn test_same_origin_requests_preserve_non_default_https_port() {
+        let guard = EnvGuard::new(&[
+            "AGENT_BROWSER_DASHBOARD_ALLOWED_ORIGINS",
+            "AGENT_BROWSER_DASHBOARD_ACCESS_TOKEN",
+        ]);
+        let token = "a".repeat(64);
+        guard.set(
+            "AGENT_BROWSER_DASHBOARD_ALLOWED_ORIGINS",
+            "https://dashboard.agent-browser.localhost:80",
+        );
+        guard.set("AGENT_BROWSER_DASHBOARD_ACCESS_TOKEN", &token);
+
+        let http = format!(
+            "GET /api/sessions HTTP/1.1\r\nHost: dashboard.agent-browser.localhost:80\r\nOrigin: https://dashboard.agent-browser.localhost:80\r\nCookie: {DASHBOARD_ACCESS_TOKEN_COOKIE}={token}\r\n\r\n"
+        );
+        assert!(is_same_origin_dashboard_request(&http));
+
+        let websocket = format!(
+            "GET /api/session/9222/stream HTTP/1.1\r\nHost: dashboard.agent-browser.localhost:80\r\nOrigin: https://dashboard.agent-browser.localhost:80\r\nCookie: {DASHBOARD_ACCESS_TOKEN_COOKIE}={token}\r\nUpgrade: websocket\r\n\r\n"
+        );
+        assert!(is_authorized_dashboard_websocket_request(&websocket));
     }
 
     #[test]
