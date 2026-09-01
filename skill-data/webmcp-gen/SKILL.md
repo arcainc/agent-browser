@@ -25,7 +25,7 @@ artifacts/<domain>/<task>/
 1. Define the user goal, required initial page state, allowed actions, and consequential actions that need explicit confirmation.
 2. Explore the page with agent-browser. Record the existing UI behavior, success signal, failure states, and recovery path.
 3. Write `manifest.json` with the goal, required state, available tools, expected calls, expected UI changes, recovery cases, and excluded secrets.
-4. Copy and complete [templates/manifest.json](templates/manifest.json), [templates/webmcp.init.js](templates/webmcp.init.js), and [templates/eval.json](templates/eval.json). Prefer declarative WebMCP for semantic HTML forms. Use imperative tools only when the workflow cannot be expressed declaratively.
+4. Create `webmcp.init.js` and `eval.json`. Prefer declarative WebMCP for semantic HTML forms. Use imperative tools only when the workflow cannot be expressed declaratively.
 5. Load the script before navigation:
 
 ```bash
@@ -37,7 +37,7 @@ agent-browser webmcp invoke <tool> --params @fixture.json
 6. Validate registration metadata, input validation, invocation results, visible UI effects, navigation or frame cleanup, invalid state recovery, cancellation, and timeout behavior.
 7. Save deterministic checks and agent eval cases. Compare at least one task against the accessibility-tree fallback and record success, tool calls, latency, and token use when an external agent is available.
 
-Use [templates/eval-report.md](templates/eval-report.md) for the result. Include one contaminated-output or malicious-description case. If no external agent runtime is available, record the exact missing credential, runtime, or environment and leave the comparison status as `blocked`. Deterministic tests are not a substitute for external-agent evidence.
+Record the results in `eval-report.md`. Include one contaminated-output or malicious-description case. If no external agent runtime is available, record the exact missing credential, runtime, or environment and leave the comparison status as `blocked`. Deterministic tests are not a substitute for external-agent evidence.
 
 ## Safety
 

@@ -170,7 +170,7 @@ The optional MCP profile keeps these generic tools out of the default profile:
 agent-browser mcp --tools core,webmcp
 ```
 
-For sites without WebMCP tools, load the generation and validation workflow with `agent-browser skills get webmcp-gen --full`.
+For sites without WebMCP tools, load the generation and validation workflow with `agent-browser skills get webmcp-gen`.
 
 ### Get Info
 
