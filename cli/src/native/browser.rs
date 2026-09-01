@@ -3,7 +3,7 @@ use std::collections::{HashMap, HashSet};
 use std::future::Future;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-use tokio::sync::{broadcast, Mutex};
+use tokio::sync::broadcast;
 
 use super::cdp::chrome::{auto_connect_cdp, launch_chrome, ChromeProcess, LaunchOptions};
 use super::cdp::client::CdpClient;
@@ -2200,7 +2200,10 @@ async fn poll_network_idle(
     rx: &mut broadcast::Receiver<CdpEvent>,
     overall_timeout: tokio::time::Duration,
 ) -> Result<(), String> {
-    let pending = Arc::new(Mutex::new(HashSet::<String>::new()));
+    // This loop owns the receiver and is never accessed concurrently. Keep
+    // the in-flight request set local instead of paying an async mutex lock
+    // for every Network event in a busy page.
+    let mut pending = HashSet::<String>::new();
 
     tokio::time::timeout(overall_timeout, async {
         let mut idle_start: Option<tokio::time::Instant> = None;
@@ -2211,25 +2214,24 @@ async fn poll_network_idle(
 
             match recv_result {
                 Ok(Ok(event)) if event.session_id.as_deref() == Some(session_id) => {
-                    let mut p = pending.lock().await;
                     match event.method.as_str() {
                         "Network.requestWillBeSent" => {
                             if let Some(id) = event.params.get("requestId").and_then(|v| v.as_str())
                             {
-                                p.insert(id.to_string());
+                                pending.insert(id.to_string());
                                 idle_start = None;
                             }
                         }
                         "Network.loadingFinished" | "Network.loadingFailed" => {
                             if let Some(id) = event.params.get("requestId").and_then(|v| v.as_str())
                             {
-                                p.remove(id);
-                                if p.is_empty() {
+                                pending.remove(id);
+                                if pending.is_empty() {
                                     idle_start = Some(tokio::time::Instant::now());
                                 }
                             }
                         }
-                        "Page.loadEventFired" if p.is_empty() => {
+                        "Page.loadEventFired" if pending.is_empty() => {
                             idle_start = Some(tokio::time::Instant::now());
                         }
                         _ => {}
@@ -2244,8 +2246,7 @@ async fn poll_network_idle(
                     // immediately.  This prevents false-positive idle
                     // detection when the subscription starts after the page
                     // has already loaded (e.g. cached pages).
-                    let p = pending.lock().await;
-                    if p.is_empty() && idle_start.is_none() {
+                    if pending.is_empty() && idle_start.is_none() {
                         idle_start = Some(tokio::time::Instant::now());
                     }
                 }
