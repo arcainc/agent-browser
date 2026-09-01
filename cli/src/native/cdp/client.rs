@@ -277,7 +277,9 @@ impl CdpClient {
         params: Option<Value>,
         session_id: Option<&str>,
     ) -> Result<Value, String> {
-        let id = self.next_id.fetch_add(1, Ordering::SeqCst);
+        // IDs only need uniqueness; no cross-thread memory ordering depends on
+        // the counter because pending commands are synchronized separately.
+        let id = self.next_id.fetch_add(1, Ordering::Relaxed);
 
         let cmd = CdpCommand {
             id,
@@ -387,7 +389,7 @@ impl CdpClient {
         params: Option<Value>,
         session_id: Option<&str>,
     ) -> Result<(), String> {
-        let id = self.next_id.fetch_add(1, Ordering::SeqCst);
+        let id = self.next_id.fetch_add(1, Ordering::Relaxed);
         let cmd = CdpCommand {
             id,
             method: method.to_string(),
