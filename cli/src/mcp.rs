@@ -151,10 +151,10 @@ const TOOL_CONNECT: &str = "agent_browser_connect";
 const TOOL_STREAM_ENABLE: &str = "agent_browser_stream_enable";
 const TOOL_STREAM_DISABLE: &str = "agent_browser_stream_disable";
 const TOOL_STREAM_STATUS: &str = "agent_browser_stream_status";
-const TOOL_WEBMCP_LIST: &str = "webmcp_list";
-const TOOL_WEBMCP_INVOKE: &str = "webmcp_invoke";
-const TOOL_WEBMCP_RESULT: &str = "webmcp_result";
-const TOOL_WEBMCP_CANCEL: &str = "webmcp_cancel";
+const TOOL_WEBMCP_LIST: &str = "agent_browser_webmcp_list";
+const TOOL_WEBMCP_INVOKE: &str = "agent_browser_webmcp_invoke";
+const TOOL_WEBMCP_RESULT: &str = "agent_browser_webmcp_result";
+const TOOL_WEBMCP_CANCEL: &str = "agent_browser_webmcp_cancel";
 const TOOL_SESSION: &str = "agent_browser_session";
 const TOOL_SESSION_LIST: &str = "agent_browser_session_list";
 const TOOL_SESSION_ID: &str = "agent_browser_session_id";
@@ -3992,6 +3992,7 @@ mod tests {
         assert!(names.contains(&TOOL_SESSION_ID));
         assert!(names.contains(&TOOL_SESSION_INFO));
         assert!(!names.contains(&"agent_browser_frame_list"));
+        assert!(names.iter().all(|name| name.starts_with("agent_browser_")));
     }
 
     #[test]
