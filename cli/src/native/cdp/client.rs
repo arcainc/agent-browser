@@ -49,7 +49,10 @@ fn normalize_websocket_root_path(url: &str) -> String {
 /// Used by the inspect proxy to forward responses and events to DevTools.
 #[derive(Debug, Clone)]
 pub struct RawCdpMessage {
-    pub text: String,
+    /// Shared because `tokio::sync::broadcast` clones each item for every
+    /// receiver. Inspect traffic can contain multi-megabyte snapshots and
+    /// screenshots; cloning the Arc keeps fan-out O(1) in payload size.
+    pub text: Arc<str>,
     pub session_id: Option<String>,
 }
 
@@ -194,7 +197,7 @@ impl CdpClient {
                                 .ok()
                                 .and_then(|v| v.get("sessionId")?.as_str().map(String::from));
                             let _ = raw_tx_clone.send(RawCdpMessage {
-                                text: msg,
+                                text: Arc::from(msg),
                                 session_id,
                             });
                         }
@@ -206,7 +209,7 @@ impl CdpClient {
                 // instead of parsing the complete JSON payload a second time.
                 if raw_tx_clone.receiver_count() > 0 {
                     let _ = raw_tx_clone.send(RawCdpMessage {
-                        text: msg,
+                        text: Arc::from(msg),
                         session_id: parsed.session_id.clone(),
                     });
                 }
