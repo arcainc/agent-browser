@@ -1,0 +1,17 @@
+{
+  "goal": "",
+  "initialState": [],
+  "allowedActions": [],
+  "consequentialActions": [],
+  "availableTools": [],
+  "expectedCalls": [],
+  "expectedUiChanges": [],
+  "recoveryCases": [],
+  "excludedSecrets": [
+    "credentials",
+    "cookies",
+    "bearer tokens",
+    "API keys",
+    "local storage secrets"
+  ]
+}
