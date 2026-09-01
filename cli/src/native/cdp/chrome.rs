@@ -2067,10 +2067,16 @@ mod tests {
         let result = build_chrome_args(&opts).unwrap();
         assert!(result.args.iter().any(|a| a == "--enable-unsafe-webgpu"));
         if cfg!(target_os = "linux") {
-            assert!(result
+            let features: Vec<&str> = result
                 .args
                 .iter()
-                .any(|a| a == "--enable-features=NetworkService,NetworkServiceInProcess,Vulkan"));
+                .find_map(|arg| arg.strip_prefix("--enable-features="))
+                .unwrap()
+                .split(',')
+                .collect();
+            assert!(features.contains(&"NetworkService"));
+            assert!(features.contains(&"NetworkServiceInProcess"));
+            assert!(features.contains(&"Vulkan"));
             assert!(result.args.iter().any(|a| a == "--use-angle=vulkan"));
             assert!(result.args.iter().any(|a| a == "--use-vulkan=swiftshader"));
             assert!(result
