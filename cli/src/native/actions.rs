@@ -4798,6 +4798,14 @@ async fn handle_navigate(cmd: &Value, state: &mut DaemonState) -> Result<Value, 
         .get("url")
         .and_then(|v| v.as_str())
         .ok_or("Missing 'url' parameter")?;
+
+    {
+        let df = state.domain_filter.read().await;
+        if let Some(ref filter) = *df {
+            filter.check_url(url)?;
+        }
+    }
+
     if let Some(session_id) = state
         .browser
         .as_ref()
@@ -4809,13 +4817,6 @@ async fn handle_navigate(cmd: &Value, state: &mut DaemonState) -> Result<Value, 
         state.webmcp.clear_invocations();
     }
     let _ = enable_webmcp_events(state).await;
-
-    {
-        let df = state.domain_filter.read().await;
-        if let Some(ref filter) = *df {
-            filter.check_url(url)?;
-        }
-    }
 
     // WebDriver backend path
     if let Some(ref wb) = state.webdriver_backend {
@@ -13052,6 +13053,37 @@ mod tests {
         assert!(error.contains("evil.example"));
         assert!(error.contains("allowed domains"));
         assert!(state.browser.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_rejected_navigation_preserves_webmcp_invocations() {
+        let mut state = DaemonState::new();
+        state
+            .webmcp
+            .insert(webmcp::InvocationRecord::pending(
+                "pending-1".to_string(),
+                "pending-tool".to_string(),
+                "frame-1".to_string(),
+                "https://example.com".to_string(),
+            ))
+            .unwrap();
+        {
+            let mut df = state.domain_filter.write().await;
+            *df = Some(DomainFilter::new("example.com"));
+        }
+
+        let error = handle_navigate(
+            &json!({
+                "action": "navigate",
+                "url": "https://evil.example/private"
+            }),
+            &mut state,
+        )
+        .await
+        .unwrap_err();
+
+        assert!(error.contains("evil.example"));
+        assert_eq!(state.webmcp.invocations["pending-1"].status, "pending");
     }
 
     #[tokio::test]
