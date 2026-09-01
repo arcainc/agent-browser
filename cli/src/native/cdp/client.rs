@@ -18,6 +18,18 @@ type PendingMap = Arc<Mutex<HashMap<u64, oneshot::Sender<CdpMessage>>>>;
 /// through intermediate proxies (reverse proxies, load balancers, service meshes).
 const WS_KEEPALIVE_INTERVAL_SECS: u64 = 30;
 
+/// CDP payloads are normally small, but snapshots and screenshots can be
+/// sizeable. Keep a generous upper bound so a peer cannot make the client
+/// allocate an unbounded frame/message buffer.
+const MAX_CDP_MESSAGE_BYTES: usize = 64 * 1024 * 1024;
+
+/// Broadcast channels retain a complete copy of every queued event/message.
+/// A slow inspect/devtools consumer can therefore turn a burst of large CDP
+/// payloads into significant RSS. Consumers already handle `Lagged`, so use a
+/// bounded queue sized for normal command bursts instead of 4096 messages.
+const CDP_EVENT_CHANNEL_CAPACITY: usize = 256;
+const RAW_CDP_CHANNEL_CAPACITY: usize = 256;
+
 fn normalize_websocket_root_path(url: &str) -> String {
     let Some(scheme_end) = url.find("://").map(|index| index + 3) else {
         return url.to_string();
@@ -37,7 +49,10 @@ fn normalize_websocket_root_path(url: &str) -> String {
 /// Used by the inspect proxy to forward responses and events to DevTools.
 #[derive(Debug, Clone)]
 pub struct RawCdpMessage {
-    pub text: String,
+    /// Shared because `tokio::sync::broadcast` clones each item for every
+    /// receiver. Inspect traffic can contain multi-megabyte snapshots and
+    /// screenshots; cloning the Arc keeps fan-out O(1) in payload size.
+    pub text: Arc<str>,
     pub session_id: Option<String>,
 }
 
@@ -113,8 +128,8 @@ impl CdpClient {
         }
 
         let ws_config = WebSocketConfig {
-            max_message_size: None,
-            max_frame_size: None,
+            max_message_size: Some(MAX_CDP_MESSAGE_BYTES),
+            max_frame_size: Some(MAX_CDP_MESSAGE_BYTES),
             ..Default::default()
         };
 
@@ -129,8 +144,8 @@ impl CdpClient {
         let ws_tx = Arc::new(Mutex::new(ws_tx));
 
         let pending: PendingMap = Arc::new(Mutex::new(HashMap::new()));
-        let (event_tx, _) = broadcast::channel(4096);
-        let (raw_tx, _) = broadcast::channel(4096);
+        let (event_tx, _) = broadcast::channel(CDP_EVENT_CHANNEL_CAPACITY);
+        let (raw_tx, _) = broadcast::channel(RAW_CDP_CHANNEL_CAPACITY);
 
         let pending_clone = pending.clone();
         let event_tx_clone = event_tx.clone();
@@ -170,24 +185,34 @@ impl CdpClient {
                     }
                 };
 
-                // Broadcast raw message for inspect proxy subscribers before typed parse,
-                // so messages with negative IDs (used by the inspect proxy) are still delivered.
-                if raw_tx_clone.receiver_count() > 0 {
-                    let session_id = serde_json::from_str::<serde_json::Value>(&msg)
-                        .ok()
-                        .and_then(|v| v.get("sessionId")?.as_str().map(String::from));
-                    let _ = raw_tx_clone.send(RawCdpMessage {
-                        text: msg.clone(),
-                        session_id,
-                    });
-                }
-
                 let parsed: CdpMessage = match serde_json::from_str(&msg) {
                     Ok(m) => m,
-                    // Expected for inspect proxy messages with negative IDs
-                    // (CdpMessage.id is u64); handled via raw broadcast above.
-                    Err(_) => continue,
+                    Err(_) => {
+                        // Inspect proxy messages can use negative IDs, which
+                        // cannot be represented by CdpMessage.id (u64). Keep
+                        // forwarding those raw messages, but only pay the
+                        // second JSON parse on this exceptional path.
+                        if raw_tx_clone.receiver_count() > 0 {
+                            let session_id = serde_json::from_str::<serde_json::Value>(&msg)
+                                .ok()
+                                .and_then(|v| v.get("sessionId")?.as_str().map(String::from));
+                            let _ = raw_tx_clone.send(RawCdpMessage {
+                                text: Arc::from(msg),
+                                session_id,
+                            });
+                        }
+                        continue;
+                    }
                 };
+
+                // For valid CDP traffic, reuse the typed envelope's session ID
+                // instead of parsing the complete JSON payload a second time.
+                if raw_tx_clone.receiver_count() > 0 {
+                    let _ = raw_tx_clone.send(RawCdpMessage {
+                        text: Arc::from(msg),
+                        session_id: parsed.session_id.clone(),
+                    });
+                }
 
                 if let Some(id) = parsed.id {
                     // Response to a command
@@ -197,12 +222,16 @@ impl CdpClient {
                     }
                 } else if let Some(ref method) = parsed.method {
                     // Event
-                    let event = CdpEvent {
-                        method: method.clone(),
-                        params: parsed.params.clone().unwrap_or(Value::Null),
-                        session_id: parsed.session_id.clone(),
-                    };
-                    let _ = event_tx_clone.send(event);
+                    // Avoid cloning potentially large event params when no
+                    // command has subscribed to the typed event stream.
+                    if event_tx_clone.receiver_count() > 0 {
+                        let event = CdpEvent {
+                            method: method.clone(),
+                            params: parsed.params.clone().unwrap_or(Value::Null),
+                            session_id: parsed.session_id.clone(),
+                        };
+                        let _ = event_tx_clone.send(event);
+                    }
                 }
             }
 
@@ -251,7 +280,9 @@ impl CdpClient {
         params: Option<Value>,
         session_id: Option<&str>,
     ) -> Result<Value, String> {
-        let id = self.next_id.fetch_add(1, Ordering::SeqCst);
+        // IDs only need uniqueness; no cross-thread memory ordering depends on
+        // the counter because pending commands are synchronized separately.
+        let id = self.next_id.fetch_add(1, Ordering::Relaxed);
 
         let cmd = CdpCommand {
             id,
@@ -361,7 +392,7 @@ impl CdpClient {
         params: Option<Value>,
         session_id: Option<&str>,
     ) -> Result<(), String> {
-        let id = self.next_id.fetch_add(1, Ordering::SeqCst);
+        let id = self.next_id.fetch_add(1, Ordering::Relaxed);
         let cmd = CdpCommand {
             id,
             method: method.to_string(),
