@@ -25,6 +25,13 @@ pub const ERR_CONTEXT_CHANGED: &str = "webmcp_context_changed";
 pub const ERR_TOO_MANY_INVOCATIONS: &str = "webmcp_too_many_invocations";
 pub const ERR_OUTPUT_TOO_LARGE: &str = "webmcp_output_too_large";
 
+fn is_tool_bound_error(error: &str) -> bool {
+    error.starts_with(&format!(
+        "{}: Current page exposes more than ",
+        ERR_OUTPUT_TOO_LARGE
+    ))
+}
+
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ToolRecord {
@@ -327,6 +334,7 @@ impl RuntimeState {
                 }
             }
         }
+        self.validate_tool_bounds(session_id);
     }
 
     pub fn tools(&self, session_id: &str) -> Result<Vec<ToolRecord>, String> {
@@ -349,30 +357,32 @@ impl RuntimeState {
     }
 
     fn validate_tool_bounds(&mut self, session_id: &str) {
-        let Some(tools) = self.tools.get(session_id) else {
-            return;
-        };
-        if tools.len() > MAX_TOOL_COUNT {
-            self.tool_errors.insert(
-                session_id.to_string(),
-                format!(
+        let bound_error = self.tools.get(session_id).and_then(|tools| {
+            if tools.len() > MAX_TOOL_COUNT {
+                return Some(format!(
                     "{}: Current page exposes more than {} WebMCP tools",
                     ERR_OUTPUT_TOO_LARGE, MAX_TOOL_COUNT
-                ),
-            );
-            return;
-        }
-        let bytes = tools.values().fold(0usize, |total, tool| {
-            total.saturating_add(serde_json::to_vec(tool).map_or(0, |encoded| encoded.len()))
-        });
-        if bytes > MAX_TOOL_LIST_BYTES {
-            self.tool_errors.insert(
-                session_id.to_string(),
+                ));
+            }
+            let bytes = tools.values().fold(0usize, |total, tool| {
+                total.saturating_add(serde_json::to_vec(tool).map_or(0, |encoded| encoded.len()))
+            });
+            (bytes > MAX_TOOL_LIST_BYTES).then(|| {
                 format!(
                     "{}: Current page exposes more than {} bytes of WebMCP tool metadata",
                     ERR_OUTPUT_TOO_LARGE, MAX_TOOL_LIST_BYTES
-                ),
-            );
+                )
+            })
+        });
+
+        if let Some(error) = bound_error {
+            self.tool_errors.insert(session_id.to_string(), error);
+        } else if self
+            .tool_errors
+            .get(session_id)
+            .is_some_and(|error| is_tool_bound_error(error))
+        {
+            self.tool_errors.remove(session_id);
         }
     }
 
@@ -409,6 +419,7 @@ impl RuntimeState {
         if let Some(origins) = self.frame_origins.get_mut(session_id) {
             origins.remove(frame_id);
         }
+        self.validate_tool_bounds(session_id);
     }
 
     pub fn clear_all(&mut self) {
@@ -819,6 +830,36 @@ mod tests {
             "session",
             &json!({ "tools": tools }),
             "https://example.test",
+        );
+        assert!(state
+            .tools("session")
+            .unwrap_err()
+            .starts_with(ERR_OUTPUT_TOO_LARGE));
+
+        state.apply_tools_removed(
+            "session",
+            &json!({
+                "tools": [{"name": format!("tool_{}", MAX_TOOL_COUNT), "frameId": "main"}]
+            }),
+        );
+        assert_eq!(state.tools("session").unwrap().len(), MAX_TOOL_COUNT);
+
+        state.apply_tools_added(
+            "session",
+            &json!({
+                "tools": [{
+                    "name": "oversized",
+                    "description": "x".repeat(MAX_TOOL_RECORD_BYTES),
+                    "frameId": "main"
+                }]
+            }),
+            "https://example.test",
+        );
+        state.apply_tools_removed(
+            "session",
+            &json!({
+                "tools": [{"name": "tool_0", "frameId": "main"}]
+            }),
         );
         assert!(state
             .tools("session")
