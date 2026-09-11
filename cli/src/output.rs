@@ -197,6 +197,18 @@ fn format_webmcp_tool_text(tool: &serde_json::Value) -> String {
     format!("{} [{}]\n  {}\n  {}", name, frame, description, origin)
 }
 
+fn format_webmcp_availability_text(data: &serde_json::Value) -> Option<&'static str> {
+    let webmcp = data.get("webmcp")?;
+    (webmcp.get("available").and_then(|value| value.as_bool()) == Some(true)
+        && webmcp
+            .get("toolCount")
+            .and_then(|value| value.as_u64())
+            .is_some_and(|count| count > 0))
+    .then_some(
+        "WebMCP tools are available on this page (experimental)\nRun `agent-browser webmcp list` to view them",
+    )
+}
+
 fn confirmation_data(data: &serde_json::Value) -> Option<&serde_json::Value> {
     if data
         .get("confirmation_required")
@@ -433,6 +445,15 @@ fn format_a11y_target(target: &serde_json::Value) -> Option<String> {
     }
 }
 
+/// Render a recording's capture rate as a trailing " (30 fps)", or nothing
+/// when the payload predates the field.
+fn recording_fps_suffix(data: &serde_json::Value) -> String {
+    data.get("fps")
+        .and_then(|v| v.as_u64())
+        .map(|fps| format!(" ({} fps)", fps))
+        .unwrap_or_default()
+}
+
 pub fn print_response_with_opts(resp: &Response, action: Option<&str>, opts: &OutputOptions) {
     if opts.json {
         if opts.content_boundaries {
@@ -570,9 +591,15 @@ pub fn print_response_with_opts(resp: &Response, action: Option<&str>, opts: &Ou
             if let Some(title) = data.get("title").and_then(|v| v.as_str()) {
                 println!("{} {}", color::success_indicator(), color::bold(title));
                 println!("  {}", color::dim(url));
+                if let Some(webmcp) = format_webmcp_availability_text(data) {
+                    println!("{}", webmcp);
+                }
                 return;
             }
             println!("{}", url);
+            if let Some(webmcp) = format_webmcp_availability_text(data) {
+                println!("{}", webmcp);
+            }
             return;
         }
         if let Some(cdp_url) = data.get("cdpUrl").and_then(|v| v.as_str()) {
@@ -1005,31 +1032,44 @@ pub fn print_response_with_opts(resp: &Response, action: Option<&str>, opts: &Ou
                         println!("{} HAR recording started", color::success_indicator());
                     }
                     _ => {
+                        let rate = recording_fps_suffix(data);
                         if let Some(path) = data.get("path").and_then(|v| v.as_str()) {
-                            println!("{} Recording started: {}", color::success_indicator(), path);
+                            println!(
+                                "{} Recording started: {}{}",
+                                color::success_indicator(),
+                                path,
+                                rate
+                            );
                         } else {
-                            println!("{} Recording started", color::success_indicator());
+                            println!("{} Recording started{}", color::success_indicator(), rate);
                         }
                     }
                 }
                 return;
             }
         }
-        // Recording restart (has "stopped" field - from recording_restart action)
-        if data.get("stopped").is_some() {
+        // Recording restart (has "restarted" field - from recording_restart action)
+        if data.get("restarted").is_some() {
             let path = data
                 .get("path")
                 .and_then(|v| v.as_str())
                 .unwrap_or("unknown");
+            let rate = recording_fps_suffix(data);
             if let Some(prev_path) = data.get("previousPath").and_then(|v| v.as_str()) {
                 println!(
-                    "{} Recording restarted: {} (previous saved to {})",
+                    "{} Recording restarted: {}{} (previous saved to {})",
                     color::success_indicator(),
                     path,
+                    rate,
                     prev_path
                 );
             } else {
-                println!("{} Recording started: {}", color::success_indicator(), path);
+                println!(
+                    "{} Recording started: {}{}",
+                    color::success_indicator(),
+                    path,
+                    rate
+                );
             }
             return;
         }
@@ -1044,7 +1084,12 @@ pub fn print_response_with_opts(resp: &Response, action: Option<&str>, opts: &Ou
                         error
                     );
                 } else {
-                    println!("{} Recording saved to {}", color::success_indicator(), path);
+                    println!(
+                        "{} Recording saved to {}{}",
+                        color::success_indicator(),
+                        path,
+                        recording_fps_suffix(data)
+                    );
                 }
             } else {
                 println!("{} Recording stopped", color::success_indicator());
@@ -1460,7 +1505,8 @@ real navigation — useful for SSR debug, auth setup, and capturing fresh
 `react suspense` / `vitals` state without noise from a prior page.
 
 With a URL, launches and navigates. If no protocol is provided, https://
-is automatically prepended.
+is automatically prepended. When the page registers WebMCP tools, successful
+navigation output tells you to run `agent-browser webmcp list`.
 
 The `goto` and `navigate` aliases still require a URL.
 
@@ -1596,8 +1642,9 @@ If another element covers the click point, agent-browser reports the
 covering element instead of dispatching a click to the wrong target.
 
 Options:
-  --new-tab            Open link in a new tab instead of navigating current tab
-                       (only works on elements with href attribute)
+  --new-tab            Open link in a new tab instead of navigating current tab.
+                       The new tab inherits session setup before its first load.
+                       Only works on elements with an href attribute.
 
 Global Options:
   --json               Output as JSON
@@ -1746,7 +1793,8 @@ agent-browser select - Select a dropdown option
 
 Usage: agent-browser select <selector> <value...>
 
-Selects one or more options in a <select> dropdown by value.
+Selects one or more options in a <select> dropdown by value or visible label.
+Label matching normalizes whitespace such as non-breaking spaces.
 
 Global Options:
   --json               Output as JSON
@@ -2002,6 +2050,7 @@ Examples:
   agent-browser wait "#loading-spinner"
   agent-browser wait 2000
   agent-browser wait --url "**/dashboard"
+  # Use networkidle only for pages known to become quiet:
   agent-browser wait --load networkidle
   agent-browser wait --fn "window.appReady === true"
   agent-browser wait --text "Welcome back"
@@ -2328,9 +2377,9 @@ Settings:
   viewport <w> <h> [scale]   Set viewport size (scale = deviceScaleFactor, e.g. 2 for retina)
   device <name>              Emulate device (e.g., "iPhone 12")
   geo <lat> <lng>            Set geolocation
-  offline [on|off]           Toggle offline mode
-  headers <json>             Set extra HTTP headers
-  credentials <user> <pass>  Set HTTP authentication
+  offline [on|off]           Toggle offline mode; off restores the new-tab default
+  headers <json>             Set extra HTTP headers; use {} to clear them for new tabs
+  credentials <user> <pass>  Set HTTP authentication for current and future tabs
   media [dark|light]         Set color scheme preference
         [reduced-motion]     Enable reduced motion
 
@@ -2494,6 +2543,10 @@ referring to the same tab across commands. Optional user-assigned labels
 accepted. CDP target ids (from `tab list --json`) are also accepted as tab
 refs; unlike `t<N>` ids they stay stable across daemon restarts.
 
+Tabs opened with `tab new` or `click --new-tab` inherit the session's user
+agent, headers, HTTP credentials, init scripts, routes, and emulation
+overrides before their first document loads.
+
 Each session remembers its active tab (bound by CDP target id) and returns
 to it after a daemon restart. With --pin-tab, commands fail with a
 `tab_gone` error instead of falling back to another tab when the bound tab
@@ -2597,16 +2650,19 @@ Save Options:
   --password-selector <s>  Custom CSS selector for password field
   --submit-selector <s>    Custom CSS selector for submit button
 
-Plugin Login Options:
+Login Options:
   --credential-provider <p> Resolve credentials from configured plugin <p>
   --item <ref>              Provider-specific vault item reference
   --url <url>               Login URL override
+  --no-navigate             Use the active top-level page without initial navigation
   --username-selector <s>   Username selector override for this login
   --password-selector <s>   Password selector override for this login
   --submit-selector <s>     Submit selector override for this login
 
 Login behavior:
-  auth login waits for form selectors to appear before filling/clicking.
+  auth login navigates, then waits for form selectors before filling/clicking.
+  --no-navigate preserves the active top-level page and checks its origin
+  against the effective credential URL. Submit-triggered navigation is allowed.
   Selector wait timeout follows the default action timeout.
   Plugin credentials are resolved just-in-time and are not saved locally.
 
@@ -2618,6 +2674,7 @@ Examples:
   echo "pass" | agent-browser auth save github --url https://github.com/login --username user --password-stdin
   agent-browser auth save github --url https://github.com/login --username user --password pass
   agent-browser auth login github
+  agent-browser auth login github --no-navigate
   agent-browser auth login my-app --credential-provider vault --item "My App"
   agent-browser auth list
   agent-browser auth show github
@@ -2742,33 +2799,58 @@ The output file can be viewed in:
             r##"
 agent-browser record - Record browser session to video
 
-Usage: agent-browser record start <path.webm> [url]
+Usage: agent-browser record start <path.webm|path.mp4> [url] [--fps <n>]
        agent-browser record stop
-       agent-browser record restart <path.webm> [url]
+       agent-browser record restart <path.webm|path.mp4> [url] [--fps <n>]
 
-Record the browser to a WebM video file.
-Creates a fresh browser context but preserves cookies and localStorage.
-If no URL is provided, automatically navigates to your current page.
+Record the browser to a video file. Supported formats are .webm (VP8 via
+libvpx) and .mp4 (H.264 via libx264); any other extension is handed to
+ffmpeg as-is with H.264 video. A path with no extension is rejected.
+Records the current active page as-is: no new context, no new tab, and no
+navigation unless you pass a URL. Capture starts on the page you already
+have open, so hydration and initial animations are not re-run cold.
+If a URL is provided, the active tab navigates there first.
+To record in a separate tab, run `tab new [url]` before `record start`.
+
+Requires ffmpeg on PATH with the libvpx and libx264 encoders (brew install
+ffmpeg, or apt install ffmpeg). Run `agent-browser doctor` to check.
+
+Recording captures 30 fps, which keeps scrolls and CSS transitions smooth.
+Raise it to 60 for short, motion-heavy takes (drag interactions, animation
+work); lower it for long sessions where file size matters more than motion.
 
 Operations:
-  start <path> [url]     Start recording (defaults to current URL if omitted)
+  start <path> [url]     Start recording the active page (navigates first if url given)
   stop                   Stop recording and save video
   restart <path> [url]   Stop current recording (if any) and start a new one
+
+Options:
+  --fps <n>            Capture rate, 1-60 (default: 30)
 
 Global Options:
   --json               Output as JSON
   --session <name>     Use specific session
 
 Examples:
-  # Record from current page (preserves login state)
+  # Record the page you are on (keeps login state and page state)
   agent-browser open https://app.example.com/dashboard
   agent-browser snapshot -i            # Explore and plan
   agent-browser record start ./demo.webm
   agent-browser click @e3              # Execute planned actions
   agent-browser record stop
 
-  # Or specify a different URL
+  # Navigate the active tab, then record
   agent-browser record start ./demo.webm https://example.com
+
+  # Record in a separate tab
+  agent-browser tab new https://example.com
+  agent-browser record start ./demo.webm
+
+  # 60 fps for a scroll or animation capture
+  agent-browser record start ./scroll.webm --fps 60
+
+  # 10 fps for a long session where size matters more than motion
+  agent-browser record start ./soak.webm --fps 10
 
   # Restart recording with a new file (stops previous, starts new)
   agent-browser record restart ./take2.webm
@@ -3613,7 +3695,7 @@ Core Commands:
   focus <sel>                Focus element
   check <sel>                Check checkbox
   uncheck <sel>              Uncheck checkbox
-  select <sel> <val...>      Select dropdown option
+  select <sel> <val...>      Select dropdown by value or visible label
   drag <src> <dst>           Drag and drop
   upload <sel> <files...>    Upload files
   download <sel> <path>      Download file by clicking element
@@ -3672,7 +3754,7 @@ Debug:
   trace start                Start Chrome DevTools trace
   trace stop [path]          Stop and save Chrome DevTools trace
   profiler start|stop [path] Record Chrome DevTools profile
-  record start <path> [url]  Start video recording (WebM)
+  record start <path> [url]  Start video recording (.webm/.mp4; --fps 1-60; needs ffmpeg)
   record stop                Stop and save video
   console [--clear]          View console logs
   errors [--clear]           View page errors
@@ -3691,6 +3773,7 @@ WebMCP (experimental):
                              --frame <frame-id>, --detach, and --timeout <ms>
   webmcp result <id>         Wait for a detached invocation result
   webmcp cancel <id>         Cancel an active invocation
+  Successful navigation advertises when the page has WebMCP tools
 
 React (requires `open --enable react-devtools`):
   react tree                 Full React component tree (depth id parent name columns)
@@ -3717,7 +3800,7 @@ SPA:
                              history.pushState + popstate/navigate events for other frameworks
 
 Init scripts:
-  removeinitscript <id>      Remove a script registered via --init-script or addinitscript
+  removeinitscript <id>      Remove a registered script from every tab in the session
 
 Batch:
   batch [--bail] ["cmd" ...]  Execute multiple commands sequentially (args or stdin)
@@ -3726,6 +3809,8 @@ Batch:
 Auth Vault:
   auth save <name> [opts]    Save auth profile (--url, --username, --password/--password-stdin)
   auth login <name>          Login using saved credentials (waits for form fields)
+  auth login <name> --no-navigate
+                             Use active page after verifying credential URL origin
   auth login <name> --credential-provider <plugin> [--item <ref>] [--url <url>]
                              Resolve credentials from a configured plugin
   auth login <name> --username-selector <s> --password-selector <s>
@@ -3872,6 +3957,10 @@ Configuration:
     --hide-scrollbars false (keeps native scrollbars visible in headless Chromium screenshots)
 
   Extensions from user and project configs are merged (not replaced).
+
+  On Windows, headless Chrome runs on a private desktop to prevent stray desktop
+  rectangles. Owned Chrome processes close with their daemon, even if it is killed.
+  Headed browsers use the interactive desktop; externally connected browsers are not owned.
 
   Example agent-browser.json:
     {{"headed": true, "hideScrollbars": false, "proxy": "http://localhost:8080"}}
@@ -4079,7 +4168,8 @@ pub fn print_version() {
 mod tests {
     use super::{
         boundary_origin, format_a11y_text, format_storage_text, format_vitals_text,
-        format_webmcp_text, format_webmcp_tool_text, format_with_boundaries, OutputOptions,
+        format_webmcp_availability_text, format_webmcp_text, format_webmcp_tool_text,
+        format_with_boundaries, OutputOptions,
     };
     use serde_json::json;
 
@@ -4384,5 +4474,49 @@ hydration: -  phases: 0  hydratedComponents: 0"
         assert!(!first.contains("origin=https://b.example"));
         assert!(second.contains("origin=https://b.example"));
         assert!(!second.contains("origin=https://a.example"));
+    }
+
+    #[test]
+    fn test_navigation_formats_webmcp_availability_hint() {
+        let data = json!({
+            "url": "https://example.com",
+            "webmcp": {
+                "experimental": true,
+                "available": true,
+                "toolCount": 4
+            }
+        });
+
+        assert_eq!(
+            format_webmcp_availability_text(&data),
+            Some(
+                "WebMCP tools are available on this page (experimental)\nRun `agent-browser webmcp list` to view them"
+            )
+        );
+    }
+
+    #[test]
+    fn test_navigation_omits_webmcp_hint_without_available_tools() {
+        for data in [
+            json!({"url": "https://example.com"}),
+            json!({
+                "url": "https://example.com",
+                "webmcp": {
+                    "experimental": true,
+                    "available": false,
+                    "toolCount": 4
+                }
+            }),
+            json!({
+                "url": "https://example.com",
+                "webmcp": {
+                    "experimental": true,
+                    "available": true,
+                    "toolCount": 0
+                }
+            }),
+        ] {
+            assert_eq!(format_webmcp_availability_text(&data), None);
+        }
     }
 }

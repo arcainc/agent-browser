@@ -5,6 +5,8 @@
 //! so MCP behavior stays aligned with the normal CLI command surface. Daemon
 //! lifecycle settings, including the default idle timeout, use the same CLI
 //! parser and daemon as direct commands.
+//! Owned Windows Chrome uses the same private headless desktop and Job Object
+//! lifetime through MCP; headed and external-connection semantics are unchanged.
 
 use base64::{engine::general_purpose::STANDARD, Engine};
 use serde_json::{json, Value};
@@ -768,7 +770,7 @@ fn tools() -> Vec<Value> {
         tool(
             TOOL_OPEN,
             "Open page",
-            "Launch the browser and optionally navigate to a URL.",
+            "Launch the browser and optionally navigate to a URL. On Windows, owned headless Chrome uses a private desktop and its process tree closes with the daemon, including forced termination. Headed browsers use the interactive desktop. Successful navigation responses include WebMCP availability metadata when the page exposes allowed tools.",
             json!({
                 "url": { "type": "string", "description": "URL to open. Omit to launch about:blank." },
                 "headed": { "type": "boolean", "description": "Show the browser window. Explicit true/false overrides AGENT_BROWSER_HEADED and config; omit to use those defaults." },
@@ -850,7 +852,7 @@ fn tools() -> Vec<Value> {
             "Click an element by @ref or CSS selector.",
             json!({
                 "selector": selector_schema(),
-                "newTab": { "type": "boolean", "default": false, "description": "Open link targets in a new tab." }
+                "newTab": { "type": "boolean", "default": false, "description": "Open link targets in a new tab after applying session setup." }
             }),
             &["selector"],
         ),
@@ -1171,7 +1173,7 @@ fn parity_tools() -> Vec<Value> {
         tool(
             TOOL_SET_CREDENTIALS,
             "Set credentials",
-            "Set HTTP credentials.",
+            "Set HTTP credentials for the current tab and tabs opened later.",
             json!({ "username": { "type": "string" }, "password": { "type": "string" } }),
             &["username", "password"],
         ),
@@ -1276,7 +1278,7 @@ fn parity_tools() -> Vec<Value> {
         tool(
             TOOL_TAB_NEW,
             "Tab new",
-            "Open a new tab.",
+            "Open a new tab after applying session setup before its first navigation.",
             json!({ "url": { "type": "string" }, "label": { "type": "string" } }),
             &[],
         ),
@@ -1368,8 +1370,20 @@ fn parity_tools() -> Vec<Value> {
         tool(
             TOOL_RECORD_START,
             "Record start",
-            "Start video recording.",
-            json!({ "path": { "type": "string" }, "url": { "type": "string" } }),
+            "Start video recording of the current active page. Captures 30 fps by default; pass fps up to 60 for motion-heavy takes. Pass url to navigate the active tab there first. Use agent_browser_tab_new beforehand to record in a separate tab.",
+            json!({
+                "path": {
+                    "type": "string",
+                    "description": "Output file; .webm (VP8) and .mp4 (H.264) are the supported formats, other extensions are handed to ffmpeg as-is with H.264 video. Must have an extension. Needs ffmpeg on PATH.",
+                },
+                "url": { "type": "string", "description": "Navigate the active tab to this URL before recording starts." },
+                "fps": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "maximum": crate::native::recording::MAX_FPS,
+                    "description": "Capture rate in frames per second (default 30, max 60).",
+                },
+            }),
             &["path"],
         ),
         tool(
@@ -1382,8 +1396,20 @@ fn parity_tools() -> Vec<Value> {
         tool(
             TOOL_RECORD_RESTART,
             "Record restart",
-            "Restart video recording.",
-            json!({ "path": { "type": "string" }, "url": { "type": "string" } }),
+            "Restart video recording. Captures 30 fps by default; pass fps up to 60 for motion-heavy takes.",
+            json!({
+                "path": {
+                    "type": "string",
+                    "description": "Output file; .webm (VP8) and .mp4 (H.264) are the supported formats, other extensions are handed to ffmpeg as-is with H.264 video. Must have an extension. Needs ffmpeg on PATH.",
+                },
+                "url": { "type": "string" },
+                "fps": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "maximum": crate::native::recording::MAX_FPS,
+                    "description": "Capture rate in frames per second (default 30, max 60).",
+                },
+            }),
             &["path"],
         ),
         tool(
@@ -1461,7 +1487,14 @@ fn parity_tools() -> Vec<Value> {
             TOOL_AUTH_LOGIN,
             "Auth login",
             "Log in with a saved auth profile.",
-            json!({ "name": { "type": "string" } }),
+            json!({
+                "name": { "type": "string" },
+                "noNavigate": {
+                    "type": "boolean",
+                    "default": false,
+                    "description": "Use the active top-level page without performing the initial login navigation. The credential URL must match the page origin."
+                }
+            }),
             &["name"],
         ),
         tool(
@@ -1647,7 +1680,7 @@ fn parity_tools() -> Vec<Value> {
         tool(
             TOOL_REMOVE_INIT_SCRIPT,
             "Remove init script",
-            "Remove a registered init script.",
+            "Remove a registered init script from every tab in the session.",
             json!({ "id": { "type": "string" } }),
             &["id"],
         ),
@@ -2275,7 +2308,7 @@ fn call_tool(params: Option<&Value>, config: &McpConfig) -> Result<Value, Protoc
         TOOL_CLIPBOARD_COPY => call_literal(arguments, &["clipboard", "copy"]),
         TOOL_CLIPBOARD_PASTE => call_literal(arguments, &["clipboard", "paste"]),
         TOOL_AUTH_SAVE => call_auth_save(arguments),
-        TOOL_AUTH_LOGIN => call_one_string(arguments, "auth login", "name"),
+        TOOL_AUTH_LOGIN => call_auth_login(arguments),
         TOOL_AUTH_LIST => call_literal(arguments, &["auth", "list"]),
         TOOL_AUTH_SHOW => call_one_string(arguments, "auth show", "name"),
         TOOL_AUTH_DELETE => call_one_string(arguments, "auth delete", "name"),
@@ -2381,17 +2414,25 @@ fn call_cli_tool(
     validate_arguments_object(arguments)?;
     let session = optional_string(arguments, "session")?;
     let timeout_ms = optional_timeout(arguments)?;
-    let extra_args = optional_string_array(arguments, "extraArgs")?.unwrap_or_default();
-
-    let mut cli_args = vec!["--json".to_string()];
-    append_common_global_args(&mut cli_args, arguments, session.as_deref())?;
-    cli_args.extend(command_args);
-    cli_args.extend(extra_args);
+    let cli_args = cli_tool_args(arguments, command_args, session.as_deref())?;
 
     let run = run_cli(&cli_args, stdin_body, timeout_ms).map_err(|e| {
         ProtocolError::invalid_params(format!("Failed to run agent-browser: {}", e))
     })?;
     Ok(tool_result_from_run(run))
+}
+
+fn cli_tool_args(
+    arguments: &Value,
+    command_args: Vec<String>,
+    session: Option<&str>,
+) -> Result<Vec<String>, ProtocolError> {
+    let extra_args = optional_string_array(arguments, "extraArgs")?.unwrap_or_default();
+    let mut args = vec!["--json".to_string()];
+    append_common_global_args(&mut args, arguments, session)?;
+    args.extend(command_args);
+    args.extend(extra_args);
+    Ok(args)
 }
 
 fn command_parts(command: &str) -> Vec<String> {
@@ -3052,12 +3093,21 @@ fn call_profiler_start(arguments: &Value) -> Result<Value, ProtocolError> {
     call_cli_tool(arguments, args, None)
 }
 
-fn call_record_start(arguments: &Value, action: &str) -> Result<Value, ProtocolError> {
+fn record_command_args(arguments: &Value, action: &str) -> Result<Vec<String>, ProtocolError> {
     let path = required_string(arguments, "path")?;
     let mut args = vec!["record".to_string(), action.to_string(), path];
     if let Some(url) = optional_string(arguments, "url")? {
         args.push(url);
     }
+    if let Some(fps) = optional_u64(arguments, "fps")? {
+        args.push("--fps".to_string());
+        args.push(fps.to_string());
+    }
+    Ok(args)
+}
+
+fn call_record_start(arguments: &Value, action: &str) -> Result<Value, ProtocolError> {
+    let args = record_command_args(arguments, action)?;
     call_cli_tool(arguments, args, None)
 }
 
@@ -3094,6 +3144,19 @@ fn call_auth_save(arguments: &Value) -> Result<Value, ProtocolError> {
     }
     args.push("--password-stdin".to_string());
     call_cli_tool(arguments, args, Some(password))
+}
+
+fn auth_login_args(arguments: &Value) -> Result<Vec<String>, ProtocolError> {
+    let name = required_string(arguments, "name")?;
+    let mut args = vec!["auth".to_string(), "login".to_string(), name];
+    if optional_bool(arguments, "noNavigate")?.unwrap_or(false) {
+        args.push("--no-navigate".to_string());
+    }
+    Ok(args)
+}
+
+fn call_auth_login(arguments: &Value) -> Result<Value, ProtocolError> {
+    call_cli_tool(arguments, auth_login_args(arguments)?, None)
 }
 
 fn call_state_clear(arguments: &Value) -> Result<Value, ProtocolError> {
@@ -4002,6 +4065,9 @@ mod tests {
             .iter()
             .find(|t| t["name"].as_str() == Some(TOOL_OPEN))
             .unwrap();
+        assert!(open["description"]
+            .as_str()
+            .is_some_and(|description| description.contains("WebMCP availability metadata")));
         let props = &open["inputSchema"]["properties"];
         assert!(props.get("headed").is_some());
         assert!(props.get("webgpu").is_some());
@@ -4034,6 +4100,35 @@ mod tests {
         assert_eq!(
             open_args(&json!({ "webmcp": true })).unwrap(),
             vec!["--no-webmcp", "false", "open"]
+        );
+    }
+
+    #[test]
+    fn open_uses_cli_headless_selection_with_custom_windows_chrome() {
+        let guard = crate::test_utils::EnvGuard::new(&["AGENT_BROWSER_HEADED"]);
+        guard.set("AGENT_BROWSER_HEADED", "true");
+        // An MCP caller can explicitly select the headless/private-desktop
+        // launch path even when the user's default is headed.
+        let arguments = json!({
+            "headed": false,
+            "url": "https://example.com",
+            "extraArgs": ["--executable-path", "C:\\Chrome for Testing\\chrome.exe"]
+        });
+        let args = cli_tool_args(&arguments, open_args(&arguments).unwrap(), None).unwrap();
+        let flags = crate::flags::parse_flags(&args);
+        assert!(!flags.headed);
+        assert!(flags.cli_headed);
+        assert_eq!(
+            flags.executable_path.as_deref(),
+            Some("C:\\Chrome for Testing\\chrome.exe")
+        );
+        let command =
+            crate::commands::parse_command(&crate::flags::clean_args(&args), &flags).unwrap();
+        assert_eq!(command["action"], "navigate");
+        assert_eq!(command["url"], "https://example.com");
+        assert_eq!(
+            open_args(&json!({"headed": true})).unwrap(),
+            ["--headed", "true", "open"]
         );
     }
 
@@ -4079,6 +4174,32 @@ mod tests {
             }))
             .unwrap(),
             vec!["webmcp", "result", "invocation-1", "--timeout", "250"]
+        );
+    }
+
+    #[test]
+    fn auth_login_tool_exposes_and_forwards_no_navigate() {
+        let tools = tools();
+        let auth_login = tools
+            .iter()
+            .find(|tool| tool["name"].as_str() == Some(TOOL_AUTH_LOGIN))
+            .unwrap();
+        assert_eq!(
+            auth_login["inputSchema"]["properties"]["noNavigate"]["type"],
+            "boolean"
+        );
+
+        assert_eq!(
+            auth_login_args(&json!({ "name": "work" })).unwrap(),
+            vec!["auth", "login", "work"]
+        );
+        assert_eq!(
+            auth_login_args(&json!({ "name": "work", "noNavigate": false })).unwrap(),
+            vec!["auth", "login", "work"]
+        );
+        assert_eq!(
+            auth_login_args(&json!({ "name": "work", "noNavigate": true })).unwrap(),
+            vec!["auth", "login", "work", "--no-navigate"]
         );
     }
 
@@ -4513,6 +4634,61 @@ mod tests {
             .unwrap();
         // Must stay in sync with the CLI parser's accepted --content values.
         assert_eq!(modes, &vec![json!("all"), json!("text"), json!("none")]);
+    }
+
+    #[test]
+    fn record_schema_and_args_include_fps() {
+        for name in [TOOL_RECORD_START, TOOL_RECORD_RESTART] {
+            let tool = tools()
+                .into_iter()
+                .find(|tool| tool["name"].as_str() == Some(name))
+                .unwrap();
+            let fps = &tool["inputSchema"]["properties"]["fps"];
+            assert_eq!(fps["type"], "integer");
+            assert_eq!(fps["minimum"], json!(1));
+            // Must stay in sync with the CLI parser's --fps ceiling.
+            assert_eq!(fps["maximum"], json!(crate::native::recording::MAX_FPS));
+
+            // The parser requires an extension and the two tuned formats are
+            // the ones to steer callers toward.
+            let path_desc = tool["inputSchema"]["properties"]["path"]["description"]
+                .as_str()
+                .unwrap();
+            for needle in [".webm", ".mp4", "ffmpeg"] {
+                assert!(
+                    path_desc.contains(needle),
+                    "{} path description should mention {}: {}",
+                    name,
+                    needle,
+                    path_desc
+                );
+            }
+        }
+
+        assert_eq!(
+            record_command_args(&json!({ "path": "demo.webm", "fps": 60 }), "start").unwrap(),
+            vec!["record", "start", "demo.webm", "--fps", "60"]
+        );
+        assert_eq!(
+            record_command_args(
+                &json!({ "path": "take2.webm", "url": "https://example.com", "fps": 24 }),
+                "restart"
+            )
+            .unwrap(),
+            vec![
+                "record",
+                "restart",
+                "take2.webm",
+                "https://example.com",
+                "--fps",
+                "24"
+            ]
+        );
+        // Omitting fps leaves the default to the CLI parser and daemon.
+        assert_eq!(
+            record_command_args(&json!({ "path": "demo.webm" }), "start").unwrap(),
+            vec!["record", "start", "demo.webm"]
+        );
     }
 
     #[test]
